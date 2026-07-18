@@ -187,7 +187,13 @@ async function transferToVendor(vendor, amountKobo, reference, reason) {
 async function createSession(phone, isAdmin = false, requesterJid = null) {
   const clean = cleanPhone(phone);
 
-  // ── FIX: Properly clean up existing session ──
+  // ── Check DB readiness for MongoDB auth ──
+  if (IS_RENDER && !dbReady) {
+    console.log(`⏸️ Cannot create session for ${clean}: DB not ready`);
+    return { success: false, error: 'Database not connected' };
+  }
+
+  // ── Properly clean up existing session ──
   if (sessions.has(clean)) {
     const existing = sessions.get(clean);
     console.log(`🧹 Cleaning up existing session for ${clean}`);
@@ -253,6 +259,9 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
 
     const connectionPromise = new Promise((resolve) => {
       
+      // ── FIX: Store timeout ID so we can clear it ──
+      let qrTimeoutId = null;
+      
       sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
@@ -314,6 +323,12 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
         
         // ── CONNECTION OPENED ──
         if (connection === 'open' && !sessionData.resolved) {
+          // ── FIX: Clear timeout so it doesn't fire after connection ──
+          if (qrTimeoutId) {
+            clearTimeout(qrTimeoutId);
+            qrTimeoutId = null;
+          }
+          
           sessionData.connected = true;
           sessionData.resolved = true;
           sessionData.reconnectAttempts = 0;
@@ -331,6 +346,12 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
           const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
           
           console.log(`❌ [${clean}] Disconnected (code: ${statusCode}). Reconnect: ${shouldReconnect}`);
+
+          // ── FIX: Clear timeout on disconnect too ──
+          if (qrTimeoutId) {
+            clearTimeout(qrTimeoutId);
+            qrTimeoutId = null;
+          }
 
           // ── FIX: Handle 401 Unauthorized ──
           if (statusCode === 401) {
@@ -412,8 +433,8 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
         }
       });
       
-      // ── FIX: Only timeout if not connected ──
-      setTimeout(() => {
+      // ── FIX: Store timeout ID ──
+      qrTimeoutId = setTimeout(() => {
         if (!sessionData.resolved && !sessionData.connected) {
           console.log(`⏰ [${clean}] QR timeout reached`);
           sessionData.resolved = true;
@@ -1091,17 +1112,33 @@ setInterval(async () => {
 
 // ─── ADMIN SESSION WATCHDOG ─────────────────────────────────────────
 setInterval(async () => {
+  if (!dbReady) {
+    console.log('⏸️ Watchdog skipped: DB not ready');
+    return;
+  }
+  
   const adminClean = cleanPhone(ADMIN_PHONE);
   const adminSession = sessions.get(adminClean);
   
-  if (!adminSession || (!adminSession.connected && !adminSession.resolved)) {
-    console.log('👀 Admin session watchdog: reconnecting...');
+  // Only reconnect if no session exists or explicitly disconnected
+  if (!adminSession) {
+    console.log('👀 Admin session watchdog: no session, reconnecting...');
     await createSession(ADMIN_PHONE, true);
   }
+  else if (adminSession.resolved && !adminSession.connected) {
+    console.log('👀 Admin session watchdog: was disconnected, reconnecting...');
+    await createSession(ADMIN_PHONE, true);
+  }
+  // If connected or syncing (undefined), do nothing
 }, 30000);
 
 // ─── AUTO-RECONNECT ALL SESSIONS ON STARTUP ─────────────────────────
 async function reconnectAllSessions() {
+  if (!dbReady) {
+    console.log('⏸️ Reconnect skipped: DB not ready');
+    return;
+  }
+  
   console.log('🔄 Checking for sessions to reconnect...');
   
   if (ADMIN_PHONE && !sessions.get(cleanPhone(ADMIN_PHONE))?.connected) {
