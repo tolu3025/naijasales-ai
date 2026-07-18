@@ -11,6 +11,7 @@ const QRCode = require('qrcode');
 const fs = require('fs');
 const crypto = require('crypto');
 const axios = require('axios');
+const { useMongoDBAuthState } = require('./authStore');
 
 const app = express();
 
@@ -25,6 +26,7 @@ const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_SECRET;
 const WEBHOOK_BASE = process.env.WEBHOOK_BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
 const BASE_DIR = process.env.RENDER_DISK_PATH || '.';
+const IS_RENDER = !!process.env.RENDER_DISK_PATH;
 
 if (!ADMIN_PHONE) {
   console.error('❌ ADMIN_PHONE not set in .env');
@@ -36,11 +38,12 @@ if (!PAYSTACK_SECRET) {
   process.exit(1);
 }
 
-// ─── ENSURE AUTH DIRECTORY EXISTS (Render persistence) ──────────────
-const authBaseDir = process.env.RENDER_DISK_PATH || '.';
-const authDir = `${authBaseDir}/auth_info`;
-if (!fs.existsSync(authDir)) {
-  fs.mkdirSync(authDir, { recursive: true });
+// ─── ENSURE AUTH DIRECTORY EXISTS (Local/Termux only) ───────────────
+if (!IS_RENDER) {
+  const authDir = `${BASE_DIR}/auth_info`;
+  if (!fs.existsSync(authDir)) {
+    fs.mkdirSync(authDir, { recursive: true });
+  }
 }
 
 // ─── MONGODB ────────────────────────────────────────────────────────
@@ -180,14 +183,9 @@ async function transferToVendor(vendor, amountKobo, reference, reason) {
   } catch (err) { return { status: false, message: err.message }; }
 }
 
-// ─── SESSION CREATION (QR CODE VERSION) ──────────────────────────────
+// ─── SESSION CREATION (WITH MONGODB AUTH PERSISTENCE) ────────────────
 async function createSession(phone, isAdmin = false, requesterJid = null) {
   const clean = cleanPhone(phone);
-  const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
-
-  if (!fs.existsSync(sessionDir)) {
-    fs.mkdirSync(sessionDir, { recursive: true });
-  }
 
   if (sessions.has(clean)) {
     const existing = sessions.get(clean);
@@ -202,7 +200,25 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
     const { version, isLatest } = await fetchLatestBaileysVersion();
     console.log(`[${clean}] Using WA version: ${version.join('.')}, isLatest: ${isLatest}`);
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    let state, saveCreds;
+    
+    if (IS_RENDER) {
+      // Use MongoDB auth state on Render (persists across deploys)
+      console.log(`☁️ Using MongoDB auth state for ${clean}`);
+      const mongoAuth = await useMongoDBAuthState(clean);
+      state = mongoAuth.state;
+      saveCreds = mongoAuth.saveCreds;
+    } else {
+      // Use file-based auth on local/Termux
+      console.log(`💾 Using file auth state for ${clean}`);
+      const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
+      if (!fs.existsSync(sessionDir)) {
+        fs.mkdirSync(sessionDir, { recursive: true });
+      }
+      const fileAuth = await useMultiFileAuthState(sessionDir);
+      state = fileAuth.state;
+      saveCreds = fileAuth.saveCreds;
+    }
 
     const sock = makeWASocket({
       version,
@@ -250,12 +266,15 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
               type: 'png'
             });
             
-            const qrPath = `${sessionDir}/qr-code.png`;
-            fs.writeFileSync(qrPath, qrBuffer);
+            // Save QR locally for reference (local only)
+            if (!IS_RENDER) {
+              const qrPath = `${BASE_DIR}/auth_info/${clean}/qr-code.png`;
+              fs.writeFileSync(qrPath, qrBuffer);
+              console.log(`   Saved to: ${qrPath}`);
+            }
             console.log(`\n📱 [${clean}] QR Code generated!`);
-            console.log(`   Saved to: ${qrPath}`);
             
-            // ── FIX: Send QR via ADMIN session ──
+            // ── Send QR via ADMIN session ──
             if (requesterJid) {
               const adminSession = sessions.get(cleanPhone(ADMIN_PHONE));
               
@@ -333,9 +352,19 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
               }
             }
           } else {
+            // Logged out - clear auth
             sessionData.resolved = true;
             sessions.delete(clean);
-            fs.rmSync(sessionDir, { recursive: true, force: true });
+            
+            // Clear from MongoDB on Render, files on local
+            if (IS_RENDER) {
+              await mongoose.model('AuthState').deleteOne({ phone: clean });
+              console.log(`🗑️ Cleared MongoDB auth for ${clean}`);
+            } else {
+              const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
+              fs.rmSync(sessionDir, { recursive: true, force: true });
+            }
+            
             if (!isAdmin) {
               await Vendor.updateOne(
                 { phone: clean },
@@ -346,7 +375,7 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
         }
       });
       
-      // ── FIX: 3 minute timeout ──
+      // ── 3 minute timeout ──
       setTimeout(() => {
         if (!sessionData.resolved) {
           resolve({ success: false, error: 'Timeout - QR code expired. Please try again.' });
@@ -362,6 +391,7 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
       }
     });
 
+    // If already authenticated, skip QR
     if (state.creds?.me?.id) {
       return { success: true, alreadyConnected: true };
     }
@@ -459,7 +489,7 @@ async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone, 
       return;
     }
     const salesCount = await Order.countDocuments({ vendor_phone: vendor.phone, status: 'paid' });
-    let reply = `👤 *${vendor.business_name}*\nPhone: ${vendor.phone}\nStatus: ${v.status}\nConnected: ${vendor.auth_connected ? '✅' : '❌'}\nProducts: ${vendor.products.length}\nPaid Orders: ${salesCount}\n`;
+    let reply = `👤 *${vendor.business_name}*\nPhone: ${vendor.phone}\nStatus: ${vendor.status}\nConnected: ${vendor.auth_connected ? '✅' : '❌'}\nProducts: ${vendor.products.length}\nPaid Orders: ${salesCount}\n`;
     await sendMessage(adminPhone, fromJid, reply);
     return;
   }
@@ -787,7 +817,6 @@ async function handleVendorSelfManagement(vendor, fromJid, text, lowerText, sess
 
 // ─── CUSTOMER MESSAGE HANDLER ───────────────────────────────────────
 async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPhone, customerPhone) {
-  // ── FIX: Skip status/broadcast messages ──
   if (fromJid.includes('status@broadcast')) {
     return;
   }
@@ -968,6 +997,26 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// ─── CONNECTION MONITOR (Heartbeat to keep WA alive) ─────────────────
+setInterval(async () => {
+  for (const [phone, session] of sessions.entries()) {
+    if (!session.connected) continue;
+    
+    try {
+      await session.socket.sendPresenceUpdate('available');
+      console.log(`💓 Heartbeat sent for ${phone}`);
+    } catch (err) {
+      console.log(`⚠️ Heartbeat failed for ${phone}:`, err.message);
+      session.connected = false;
+      setTimeout(() => {
+        if (!sessions.get(phone)?.connected) {
+          createSession(phone, session.isAdmin);
+        }
+      }, 3000);
+    }
+  }
+}, 60000);
+
 // ─── AUTO-RECONNECT ALL SESSIONS ON STARTUP ─────────────────────────
 async function reconnectAllSessions() {
   console.log('🔄 Checking for sessions to reconnect...');
@@ -991,6 +1040,7 @@ async function reconnectAllSessions() {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`☁️ Render mode: ${IS_RENDER ? 'YES (MongoDB auth)' : 'NO (file auth)'}`);
   console.log(`📱 Admin: ${ADMIN_PHONE}`);
   
   if (ADMIN_PHONE) {
