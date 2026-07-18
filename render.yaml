@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: naijasales-ai
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: RENDER_DISK_PATH
+        value: /opt/render/project/src
+    disk:
+      name: auth-data
+      mountPath: /opt/render/project/src/auth_info
+      sizeGB: 1

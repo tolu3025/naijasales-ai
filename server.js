@@ -1,7 +1,13 @@
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { 
+  makeWASocket, 
+  useMultiFileAuthState, 
+  DisconnectReason,
+  fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
+const QRCode = require('qrcode');
 const fs = require('fs');
 const crypto = require('crypto');
 const axios = require('axios');
@@ -30,11 +36,30 @@ if (!PAYSTACK_SECRET) {
   process.exit(1);
 }
 
+// ─── ENSURE AUTH DIRECTORY EXISTS (Render persistence) ──────────────
+const authBaseDir = process.env.RENDER_DISK_PATH || '.';
+const authDir = `${authBaseDir}/auth_info`;
+if (!fs.existsSync(authDir)) {
+  fs.mkdirSync(authDir, { recursive: true });
+}
+
 // ─── MONGODB ────────────────────────────────────────────────────────
 let dbReady = false;
-mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 10000 })
-  .then(() => { dbReady = true; console.log('✅ MongoDB connected'); })
-  .catch(err => { console.error('❌ MongoDB error:', err.message); });
+async function connectDB() {
+  try {
+    await mongoose.connect(MONGO_URI, { 
+      serverSelectionTimeoutMS: 30000,
+      socketTimeoutMS: 45000,
+    });
+    dbReady = true;
+    console.log('✅ MongoDB connected');
+  } catch (err) {
+    console.error('❌ MongoDB error:', err.message);
+    console.log('🔄 Retrying in 5 seconds...');
+    setTimeout(connectDB, 5000);
+  }
+}
+connectDB();
 
 // ─── SCHEMAS ────────────────────────────────────────────────────────
 const VendorSchema = new mongoose.Schema({
@@ -51,7 +76,6 @@ const VendorSchema = new mongoose.Schema({
   onboarding_step: { type: Number, default: 0 },
   status: { type: String, default: 'onboarding' },
   auth_connected: { type: Boolean, default: false },
-  pairing_retries: { type: Number, default: 0 },
   created_at: { type: Date, default: Date.now }
 });
 
@@ -116,135 +140,48 @@ async function sendMessage(fromPhone, toJid, text) {
   }
 }
 
-// ─── PAYSTACK: CREATE VIRTUAL ACCOUNT ───────────────────────────────
+// ─── PAYSTACK FUNCTIONS ─────────────────────────────────────────────
 async function createVirtualAccount(order, customerName) {
   try {
-    // Step 1: Create customer
-    const customerRes = await axios.post(
-      'https://api.paystack.co/customer',
-      {
-        email: `${order.customer_phone}@temp.naijasales.ai`,
-        first_name: customerName.split(' ')[0] || 'Customer',
-        last_name: customerName.split(' ').slice(1).join(' ') || '',
-        phone: `+${order.customer_phone}`
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    if (!customerRes.data.status) {
-      return { success: false, error: customerRes.data.message };
-    }
-
-    const customerCode = customerRes.data.data.customer_code;
-
-    // Step 2: Create dedicated virtual account
-    const vaRes = await axios.post(
-      'https://api.paystack.co/dedicated_account',
-      {
-        customer: customerCode,
-        preferred_bank: 'wema-bank',
-        // For test mode, use 'test-bank'
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
+    const customerRes = await axios.post('https://api.paystack.co/customer', {
+      email: `${order.customer_phone}@temp.naijasales.ai`,
+      first_name: customerName.split(' ')[0] || 'Customer',
+      last_name: customerName.split(' ').slice(1).join(' ') || '',
+      phone: `+${order.customer_phone}`
+    }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' }});
+    if (!customerRes.data.status) return { success: false, error: customerRes.data.message };
+    const vaRes = await axios.post('https://api.paystack.co/dedicated_account', {
+      customer: customerRes.data.data.customer_code, preferred_bank: 'wema-bank'
+    }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' }});
     if (vaRes.data.status) {
       const account = vaRes.data.data;
-      return {
-        success: true,
-        account_name: account.account_name,
-        account_number: account.account_number,
-        bank_name: account.bank.name || account.bank.slug,
-        account_id: account.id,
-        customer_code: customerCode
-      };
+      return { success: true, account_name: account.account_name, account_number: account.account_number, bank_name: account.bank.name || account.bank_slug, account_id: account.id, customer_code: customerRes.data.data.customer_code };
     }
-
     return { success: false, error: vaRes.data.message };
-  } catch (err) {
-    console.error('Paystack VA error:', err.response?.data || err.message);
-    return { success: false, error: err.response?.data?.message || err.message };
-  }
+  } catch (err) { return { success: false, error: err.response?.data?.message || err.message }; }
 }
 
-// ─── PAYSTACK: VERIFY TRANSACTION ─────────────────────────────────
 async function verifyTransaction(reference) {
-  try {
-    const response = await axios.get(
-      `https://api.paystack.co/transaction/verify/${reference}`,
-      {
-        headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
-      }
-    );
-    return response.data;
-  } catch (err) {
-    console.error('Paystack verify error:', err.response?.data || err.message);
-    return { status: false, message: err.message };
-  }
+  try { return (await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }})).data; }
+  catch (err) { return { status: false, message: err.message }; }
 }
 
-// ─── PAYSTACK: TRANSFER TO VENDOR ──────────────────────────────────
 async function transferToVendor(vendor, amountKobo, reference, reason) {
   try {
-    const recipientRes = await axios.post(
-      'https://api.paystack.co/transferrecipient',
-      {
-        type: 'nuban',
-        name: vendor.verified_name || vendor.business_name,
-        account_number: vendor.account_number,
-        bank_code: vendor.bank_code || '058',
-        currency: 'NGN'
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    if (!recipientRes.data.status) {
-      return { success: false, error: recipientRes.data.message };
-    }
-
-    const recipientCode = recipientRes.data.data.recipient_code;
-
-    const transferRes = await axios.post(
-      'https://api.paystack.co/transfer',
-      {
-        source: 'balance',
-        amount: amountKobo,
-        reference: reference,
-        recipient: recipientCode,
-        reason: reason
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
+    const recipientRes = await axios.post('https://api.paystack.co/transferrecipient', {
+      type: 'nuban', name: vendor.verified_name || vendor.business_name,
+      account_number: vendor.account_number, bank_code: vendor.bank_code || '058', currency: 'NGN'
+    }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' }});
+    if (!recipientRes.data.status) return { success: false, error: recipientRes.data.message };
+    const transferRes = await axios.post('https://api.paystack.co/transfer', {
+      source: 'balance', amount: amountKobo, reference, recipient: recipientRes.data.data.recipient_code, reason
+    }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' }});
     return transferRes.data;
-  } catch (err) {
-    console.error('Paystack transfer error:', err.response?.data || err.message);
-    return { status: false, message: err.message };
-  }
+  } catch (err) { return { status: false, message: err.message }; }
 }
 
-// ─── SESSION CREATION (PAIRING FIX) ─────────────────────────────────
-async function createSession(phone, isAdmin = false) {
+// ─── SESSION CREATION (QR CODE VERSION) ──────────────────────────────
+async function createSession(phone, isAdmin = false, requesterJid = null) {
   const clean = cleanPhone(phone);
   const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
 
@@ -262,73 +199,161 @@ async function createSession(phone, isAdmin = false) {
   }
 
   try {
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`[${clean}] Using WA version: ${version.join('.')}, isLatest: ${isLatest}`);
+
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
     const sock = makeWASocket({
+      version,
       auth: state,
-      printQRInTerminal: true,
-      browser: isAdmin ? ['NaijaSales AI', 'Admin', '1.0'] : ['Chrome (Linux)', '', ''],
-      generateHighQualityLinkPreview: true,
+      printQRInTerminal: false,
+      browser: ['Mac OS', 'Chrome', '14.4.1'],
+      defaultQueryTimeoutMs: undefined,
+      markOnlineOnConnect: false,
       syncFullHistory: false,
-      markOnlineOnConnect: true,
       keepAliveIntervalMs: 30000,
-      defaultQueryTimeoutMs: 60000,
-      connectTimeoutMs: 60000
+      connectTimeoutMs: 60000,
+      retryRequestDelayMs: 2000,
     });
 
     const sessionData = {
       socket: sock,
       connected: false,
       saveCreds,
-      pairingCode: null,
       isAdmin,
-      phone: clean
+      phone: clean,
+      qrSent: false,
+      resolved: false,
+      reconnectAttempts: 0,
+      maxReconnects: 10
     };
     sessions.set(clean, sessionData);
 
-    // Credentials update handler
     sock.ev.on('creds.update', saveCreds);
 
-    // Connection update handler
-    sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect } = update;
-      console.log(`[${clean}] Connection: ${connection}`);
-
-      if (connection === 'open') {
-        sessionData.connected = true;
-        console.log(`✅ [${clean}] CONNECTED`);
-        if (!isAdmin) {
-          await Vendor.updateOne({ phone: clean }, { $set: { auth_connected: true } });
-        }
-      }
-
-      if (connection === 'close') {
-        sessionData.connected = false;
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`❌ [${clean}] Disconnected (code: ${statusCode}). Reconnect: ${shouldReconnect}`);
-
-        if (shouldReconnect) {
-          setTimeout(() => {
-            if (!sessions.get(clean)?.connected) {
-              console.log(`🔄 [${clean}] Auto-reconnecting...`);
-              createSession(clean, isAdmin);
+    const connectionPromise = new Promise((resolve) => {
+      
+      sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        
+        console.log(`[${clean}] Connection update:`, { connection, hasQR: !!qr });
+        
+        // ── GENERATE AND SEND QR CODE ──
+        if (qr && !sessionData.qrSent) {
+          sessionData.qrSent = true;
+          
+          try {
+            const qrBuffer = await QRCode.toBuffer(qr, { 
+              width: 400,
+              margin: 2,
+              type: 'png'
+            });
+            
+            const qrPath = `${sessionDir}/qr-code.png`;
+            fs.writeFileSync(qrPath, qrBuffer);
+            console.log(`\n📱 [${clean}] QR Code generated!`);
+            console.log(`   Saved to: ${qrPath}`);
+            
+            // ── FIX: Send QR via ADMIN session ──
+            if (requesterJid) {
+              const adminSession = sessions.get(cleanPhone(ADMIN_PHONE));
+              
+              if (adminSession?.socket) {
+                await adminSession.socket.sendMessage(requesterJid, {
+                  image: qrBuffer,
+                  caption: `🔑 *QR Code for ${clean}*\n\n` +
+                    `Scan this with your WhatsApp:\n` +
+                    `1. Open WhatsApp on your phone\n` +
+                    `2. Tap ⋮ → Linked Devices → Link a Device\n` +
+                    `3. Point camera at this QR code\n\n` +
+                    `⏰ Expires in 3 minutes!`
+                });
+                console.log(`   📤 QR code sent to ${requesterJid} via admin session`);
+              } else {
+                console.log(`   ⚠️ Admin session not available, showing terminal QR`);
+                const terminalQR = await QRCode.toString(qr, { type: 'terminal', small: true });
+                console.log(terminalQR);
+              }
+            } else {
+              const terminalQR = await QRCode.toString(qr, { type: 'terminal', small: true });
+              console.log(terminalQR);
             }
-          }, 5000);
-        } else {
-          sessions.delete(clean);
-          fs.rmSync(sessionDir, { recursive: true, force: true });
-          if (!isAdmin) {
-            await Vendor.updateOne(
-              { phone: clean },
-              { $set: { auth_connected: false, status: 'onboarding', onboarding_step: 9 } }
-            );
+            
+          } catch (err) {
+            console.error(`❌ QR generation error:`, err.message);
           }
         }
-      }
+        
+        // ── CONNECTION OPENED ──
+        if (connection === 'open' && !sessionData.resolved) {
+          sessionData.connected = true;
+          sessionData.resolved = true;
+          sessionData.reconnectAttempts = 0;
+          console.log(`✅ [${clean}] CONNECTED`);
+          if (!isAdmin) {
+            await Vendor.updateOne({ phone: clean }, { $set: { auth_connected: true } });
+          }
+          resolve({ success: true });
+        }
+        
+        // ── CONNECTION CLOSED ──
+        if (connection === 'close') {
+          sessionData.connected = false;
+          const statusCode = lastDisconnect?.error?.output?.statusCode;
+          const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+          
+          console.log(`❌ [${clean}] Disconnected (code: ${statusCode}). Reconnect: ${shouldReconnect}`);
+
+          if (shouldReconnect) {
+            if (sessionData.reconnectAttempts < sessionData.maxReconnects) {
+              sessionData.reconnectAttempts++;
+              console.log(`🔄 [${clean}] Reconnecting... (attempt ${sessionData.reconnectAttempts}/${sessionData.maxReconnects})`);
+              
+              const delay = Math.min(5000 * sessionData.reconnectAttempts, 30000);
+              setTimeout(() => {
+                if (!sessions.get(clean)?.connected) {
+                  createSession(clean, isAdmin, requesterJid);
+                }
+              }, delay);
+            } else {
+              console.log(`❌ [${clean}] Max reconnection attempts reached`);
+              sessionData.resolved = true;
+              if (!isAdmin) {
+                await Vendor.updateOne(
+                  { phone: clean },
+                  { $set: { auth_connected: false, status: 'onboarding', onboarding_step: 9 } }
+                );
+                const adminSession = sessions.get(cleanPhone(ADMIN_PHONE));
+                if (adminSession?.socket && requesterJid) {
+                  await adminSession.socket.sendMessage(requesterJid, {
+                    text: `❌ WhatsApp connection lost after multiple attempts. Please reply *"reconnect"* to try again.`
+                  });
+                }
+              }
+            }
+          } else {
+            sessionData.resolved = true;
+            sessions.delete(clean);
+            fs.rmSync(sessionDir, { recursive: true, force: true });
+            if (!isAdmin) {
+              await Vendor.updateOne(
+                { phone: clean },
+                { $set: { auth_connected: false, status: 'onboarding', onboarding_step: 9 } }
+              );
+            }
+          }
+        }
+      });
+      
+      // ── FIX: 3 minute timeout ──
+      setTimeout(() => {
+        if (!sessionData.resolved) {
+          resolve({ success: false, error: 'Timeout - QR code expired. Please try again.' });
+        }
+      }, 180000);
     });
 
-    // Message handler
     sock.ev.on('messages.upsert', async (m) => {
       if (m.type !== 'notify') return;
       for (const msg of m.messages) {
@@ -337,27 +362,11 @@ async function createSession(phone, isAdmin = false) {
       }
     });
 
-    // Wait for WebSocket to open before requesting pairing code
-    await new Promise((resolve) => {
-      const check = setInterval(() => {
-        if (sock.ws?.readyState === 1) {
-          clearInterval(check);
-          resolve();
-        }
-      }, 500);
-      setTimeout(() => { clearInterval(check); resolve(); }, 15000);
-    });
-
-    // If already authenticated, skip pairing
     if (state.creds?.me?.id) {
       return { success: true, alreadyConnected: true };
     }
 
-    // Request pairing code
-    const code = await sock.requestPairingCode(`+${clean}`);
-    sessionData.pairingCode = code;
-    console.log(`🔑 [${clean}] Pairing code: ${code}`);
-    return { success: true, code };
+    return await connectionPromise;
 
   } catch (err) {
     console.error(`❌ [${clean}] Session creation failed:`, err.message);
@@ -375,15 +384,30 @@ async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
   const text = getMessageText(msg);
   const lowerText = text.toLowerCase().trim();
 
-  console.log(`📩 [${sessionPhone}] ${isAdminSession ? 'ADMIN' : 'VENDOR'} | From: ${senderClean} | "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+  console.log(`📩 [${sessionPhone}] ${isAdminSession ? 'ADMIN' : 'VENDOR'} | From: ${senderClean} | Group: ${isGroup} | "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
 
   if (!dbReady) {
     console.log('⚠️ DB not ready');
     return;
   }
 
+  // ── Ignore group chats for onboarding/admin ──
+  if (isGroup && !isAdminSession) {
+    const vendor = await Vendor.findOne({ phone: sessionPhone });
+    if (!vendor || vendor.status !== 'active') {
+      return;
+    }
+    await handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPhone, senderClean);
+    return;
+  }
+
+  if (isGroup && isAdminSession) {
+    console.log(`⏸️ Ignoring group message in admin session`);
+    return;
+  }
+
   if (isAdminSession) {
-    await handleAdminMessage(senderClean, fromJid, text, lowerText, sessionPhone);
+    await handleAdminMessage(senderClean, fromJid, text, lowerText, sessionPhone, msg);
     return;
   }
 
@@ -394,7 +418,7 @@ async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
   }
 
   if (senderClean === sessionPhone) {
-    await handleVendorSelfManagement(vendor, fromJid, text, lowerText, sessionPhone);
+    await handleVendorSelfManagement(vendor, fromJid, text, lowerText, sessionPhone, msg);
     return;
   }
 
@@ -409,7 +433,12 @@ async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
 }
 
 // ─── ADMIN HANDLER ──────────────────────────────────────────────────
-async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone) {
+async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone, msg) {
+  
+  if (fromJid.endsWith('@g.us')) {
+    console.log(`⏸️ Admin handler ignoring group message from ${sender}`);
+    return;
+  }
   
   if (lowerText === '/vendors' || lowerText === 'vendors') {
     const vendors = await Vendor.find().sort({ created_at: -1 }).limit(20);
@@ -430,7 +459,7 @@ async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone) 
       return;
     }
     const salesCount = await Order.countDocuments({ vendor_phone: vendor.phone, status: 'paid' });
-    let reply = `👤 *${vendor.business_name}*\nPhone: ${vendor.phone}\nStatus: ${vendor.status}\nConnected: ${vendor.auth_connected ? '✅' : '❌'}\nProducts: ${vendor.products.length}\nPaid Orders: ${salesCount}\n`;
+    let reply = `👤 *${vendor.business_name}*\nPhone: ${vendor.phone}\nStatus: ${v.status}\nConnected: ${vendor.auth_connected ? '✅' : '❌'}\nProducts: ${vendor.products.length}\nPaid Orders: ${salesCount}\n`;
     await sendMessage(adminPhone, fromJid, reply);
     return;
   }
@@ -458,7 +487,7 @@ async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone) 
   }
 
   if (vendor.status === 'onboarding') {
-    await handleOnboarding(vendor, fromJid, text, lowerText, adminPhone);
+    await handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, msg);
     return;
   }
 
@@ -470,7 +499,7 @@ async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone) 
 }
 
 // ─── ONBOARDING FLOW ────────────────────────────────────────────────
-async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone) {
+async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, msg) {
   const step = vendor.onboarding_step;
 
   switch (step) {
@@ -557,9 +586,11 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone) {
         if (faqMatch) {
           vendor.faqs.push({ q: faqMatch[1].trim(), a: faqMatch[2].trim() });
           await vendor.save();
-          await sendMessage(adminPhone, fromJid, '✅ FAQ saved! Send another or type *"done"*.');
+          console.log(`📝 FAQ added for ${vendor.phone}: ${faqMatch[1].trim()}`);
         } else {
-          await sendMessage(adminPhone, fromJid, 'Please use format:\nQ: [question]\nA: [answer]\n\nOr type *"done"* to continue.');
+          if (text.includes('?') || text.toLowerCase().includes('q:') || text.toLowerCase().includes('a:')) {
+            await sendMessage(adminPhone, fromJid, `❌ Please use the format:\nQ: Question\nA: Answer\n\nOr type *"done"* to continue.`);
+          }
         }
       }
       break;
@@ -569,703 +600,403 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone) {
         vendor.onboarding_step = 8;
         await vendor.save();
         await sendMessage(adminPhone, fromJid, 
-          `Final step! 📋\n\n` +
-          `What are your *group rules* for customers?\n\n` +
-          `Example: "No price bargaining in group. DM for bulk orders. Respect everyone."`
+          `🎉 *Setup Complete!*\n\n` +
+          `Now let's connect your WhatsApp so customers can message you.\n\n` +
+          `Reply *"connect"* to generate a QR code.`
         );
-      } else {
-        const captionText = text || '';
-        const productMatch = captionText.match(/(.+?)\s*[₦N]\s*(\d+)/i);
-        if (productMatch) {
+      } else if (msg.message?.imageMessage) {
+        const caption = msg.message.imageMessage.caption || '';
+        const priceMatch = caption.match(/[₦N]\s*(\d+(?:,\d{3})*)/);
+        const nameMatch = caption.replace(/[₦N]\s*\d+(?:,\d{3})*/, '').trim();
+        
+        if (priceMatch && nameMatch) {
+          const price = parseInt(priceMatch[1].replace(/,/g, ''));
           vendor.products.push({
-            name: productMatch[1].trim(),
-            price: parseInt(productMatch[2])
+            name: nameMatch,
+            price: price,
+            image_url: msg.message.imageMessage.url || ''
           });
           await vendor.save();
-          await sendMessage(adminPhone, fromJid, 
-            `✅ Added: ${productMatch[1].trim()} — ₦${parseInt(productMatch[2]).toLocaleString()}\n\n` +
-            `Send another or type *"done"*`
-          );
+          await sendMessage(adminPhone, fromJid, `✅ *${nameMatch}* added at ₦${price.toLocaleString()}. Send another or type *"done"*.`);
         } else {
-          await sendMessage(adminPhone, fromJid, 'Please use format: "Product Name ₦Price"\n\nExample: "Red Ankara ₦5500"');
+          await sendMessage(adminPhone, fromJid, `❌ Please include price in caption.\nExample: "Red Ankara ₦5500"`);
         }
+      } else {
+        await sendMessage(adminPhone, fromJid, `Send a *photo* with name and price in caption, or type *"done"*.`);
       }
       break;
 
     case 8:
-      vendor.group_rules = text.trim();
-      vendor.onboarding_step = 9;
-      await vendor.save();
-      
-      await sendMessage(adminPhone, fromJid, 
-        `Almost done! 🎉\n\n` +
-        `I need to connect to your WhatsApp to sell for you. Generating your connection code...`
-      );
-      
-      setTimeout(async () => {
-        const result = await createSession(vendor.phone, false);
+      if (lowerText === 'connect') {
+        vendor.onboarding_step = 9;
+        await vendor.save();
+        await sendMessage(adminPhone, fromJid, `🔑 Generating QR code... Please wait.`);
         
-        if (result.alreadyConnected) {
+        const result = await createSession(vendor.phone, false, fromJid);
+        if (result.success) {
+          await sendMessage(adminPhone, fromJid, `✅ WhatsApp connected! Your store is now active.`);
           vendor.status = 'active';
           vendor.onboarding_step = 10;
-          vendor.auth_connected = true;
           await vendor.save();
-          await sendMessage(adminPhone, fromJid, 
-            `🎉 *${vendor.business_name}* is LIVE! 🎉\n\n` +
-            `Your store is active on your number. Customers can now message you to buy.\n\n` +
-            `*To manage your store, message your own number: ${vendor.phone}*\n\n` +
-            `*Commands:*\n• "How much sales today?"\n• "Show my catalogue"\n• "Change [product] price to [amount]"\n• "Add product [name] ₦[price]"\n• "Pause my store" / "Resume"\n\nGood luck! 🚀`
-          );
-        } else if (result.success) {
-          vendor.onboarding_step = 9.5;
-          await vendor.save();
-          await sendMessage(adminPhone, fromJid, 
-            `📱 *Your connection code: ${result.code}*\n\n` +
-            `👉 Open WhatsApp on THIS phone\n` +
-            `👉 Go to: *Settings → Linked Devices → Link with Phone Number*\n` +
-            `👉 Enter: *${result.code}*\n\n` +
-            `⏰ You have 60 seconds. Reply *"done"* when finished.`
-          );
         } else {
-          vendor.pairing_retries += 1;
-          await vendor.save();
-          await sendMessage(adminPhone, fromJid, 
-            `❌ Failed to generate code: ${result.error}\n\n` +
-            `Reply *"retry"* to try again.`
-          );
-        }
-      }, 2000);
-      break;
-
-    case 9.5:
-      if (lowerText === 'done') {
-        let attempts = 0;
-        const maxAttempts = 12;
-        
-        const pollConnection = async () => {
-          const session = sessions.get(vendor.phone);
-          
-          if (session?.connected) {
-            vendor.status = 'active';
-            vendor.onboarding_step = 10;
-            vendor.pairing_retries = 0;
-            vendor.auth_connected = true;
-            await vendor.save();
-            await sendMessage(adminPhone, fromJid, 
-              `🎉 *${vendor.business_name}* is LIVE! 🎉\n\n` +
-              `Your store is active on your number. Customers can now message you to buy.\n\n` +
-              `*To manage your store, message your own number: ${vendor.phone}*\n\n` +
-              `*Commands:*\n• "How much sales today?"\n• "Show my catalogue"\n• "Change [product] price to [amount]"\n• "Add product [name] ₦[price]"\n• "Pause my store" / "Resume"\n• "Show group rules"\n\nGood luck! 🚀`
-            );
-            return;
-          }
-          
-          attempts++;
-          if (attempts >= maxAttempts) {
-            await sendMessage(adminPhone, fromJid, 
-              `⏳ Connection not detected yet. Please check:\n` +
-              `1. You entered the code: *${session?.pairingCode || 'unknown'}*\n` +
-              `2. Your WhatsApp is the latest version\n` +
-              `3. You have stable internet\n\n` +
-              `Reply *"done"* to check again or *"retry"* for a new code.`
-            );
-            return;
-          }
-          
-          setTimeout(pollConnection, 5000);
-        };
-        
-        pollConnection();
-        
-      } else if (lowerText === 'retry') {
-        if (vendor.pairing_retries >= 3) {
-          await sendMessage(adminPhone, fromJid, 
-            `❌ Too many retries. Please make sure:\n` +
-            `1. You're using the latest WhatsApp\n` +
-            `2. Go to Settings → Linked Devices → Link with Phone Number\n` +
-            `3. Enter the code quickly (within 60 seconds)\n\n` +
-            `Reply *"retry"* to try again or *"help"* for assistance.`
-          );
-          vendor.pairing_retries = 0;
-          await vendor.save();
-          return;
-        }
-        
-        const oldSession = sessions.get(vendor.phone);
-        if (oldSession) {
-          try { oldSession.socket?.end(); } catch(e) {}
-          sessions.delete(vendor.phone);
-        }
-        
-        const result = await createSession(vendor.phone, false);
-        vendor.pairing_retries += 1;
-        await vendor.save();
-        
-        if (result.success) {
-          await sendMessage(adminPhone, fromJid, 
-            `📱 *New code: ${result.code}*\n\n` +
-            `👉 Enter this code now: *${result.code}*\n` +
-            `⏰ 60 seconds. Reply *"done"* when finished.`
-          );
-        } else {
-          await sendMessage(adminPhone, fromJid, `❌ Error: ${result.error}. Reply *"retry"* to try again.`);
+          await sendMessage(adminPhone, fromJid, `❌ Failed to connect: ${result.error || 'Unknown error'}`);
         }
       } else {
-        await sendMessage(adminPhone, fromJid, 
-          `⏳ Waiting for you to enter the pairing code.\n\n` +
-          `Reply *"done"* once you've entered it, or *"retry"* for a new code.`
-        );
+        await sendMessage(adminPhone, fromJid, `Reply *"connect"* to link your WhatsApp.`);
+      }
+      break;
+
+    case 9:
+      if (lowerText === 'reconnect') {
+        const result = await createSession(vendor.phone, false, fromJid);
+        if (result.success) {
+          await sendMessage(adminPhone, fromJid, `✅ Reconnected!`);
+          vendor.status = 'active';
+          vendor.onboarding_step = 10;
+          await vendor.save();
+        } else {
+          await sendMessage(adminPhone, fromJid, `❌ Reconnection failed: ${result.error || 'Unknown error'}`);
+        }
+      } else {
+        await sendMessage(adminPhone, fromJid, `Your WhatsApp disconnected. Reply *"reconnect"* to link again.`);
       }
       break;
 
     default:
-      await sendMessage(adminPhone, fromJid, 'Let\'s continue! What would you like to do?');
+      await sendMessage(adminPhone, fromJid, `Something went wrong. Please contact support.`);
+      break;
   }
 }
 
 // ─── VENDOR SELF-MANAGEMENT ─────────────────────────────────────────
-async function handleVendorSelfManagement(vendor, fromJid, text, lowerText, vendorPhone) {
-  
-  if (vendor.status === 'paused') {
-    if (lowerText.includes('resume')) {
-      vendor.status = 'active';
-      await vendor.save();
-      await sendMessage(vendorPhone, fromJid, '▶️ Store resumed! Taking orders now. 💪');
-    } else {
-      await sendMessage(vendorPhone, fromJid, '⏸️ Your store is paused. Say *"resume"* to start taking orders again.');
-    }
-    return;
-  }
-
-  if (lowerText.includes('sales today') || lowerText.includes('how much sales') || lowerText.includes('money today')) {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const orders = await Order.find({ vendor_phone: vendor.phone, status: 'paid', created_at: { $gte: today } });
-    const total = orders.reduce((sum, o) => sum + o.total, 0);
-    await sendMessage(vendorPhone, fromJid, `📊 *Today's Sales*\n\n💰 Total: ₦${total.toLocaleString()}\n📦 Orders: ${orders.length}\n\nKeep grinding! 💪`);
-    return;
-  }
-
-  if (lowerText.includes('sales this week') || lowerText.includes('week sales')) {
-    const weekAgo = new Date();
-    weekAgo.setDate(weekAgo.getDate() - 7);
-    const orders = await Order.find({ vendor_phone: vendor.phone, status: 'paid', created_at: { $gte: weekAgo } });
-    const total = orders.reduce((sum, o) => sum + o.total, 0);
-    await sendMessage(vendorPhone, fromJid, `📊 *This Week*\n\n💰 Total: ₦${total.toLocaleString()}\n📦 Orders: ${orders.length}`);
-    return;
-  }
-
-  if (lowerText.includes('catalogue') || lowerText.includes('show my products') || lowerText.includes('my products')) {
-    if (vendor.products.length === 0) {
-      await sendMessage(vendorPhone, fromJid, '📭 Your catalogue is empty. Send me products to add them!');
-      return;
-    }
-    let reply = `📦 *${vendor.business_name} — Catalogue*\n\n`;
-    vendor.products.forEach((p, i) => {
-      reply += `${i + 1}. ${p.name}\n   ₦${p.price.toLocaleString()}\n\n`;
-    });
-    reply += 'To change a price, say: "Change [product] price to [amount]"';
-    await sendMessage(vendorPhone, fromJid, reply);
-    return;
-  }
-
-  if (lowerText.includes('change') && lowerText.includes('price')) {
-    const match = text.match(/change\s+(.+?)\s+price\s+to\s*[₦N]?\s*(\d+)/i);
-    if (match) {
-      const productName = match[1].trim();
-      const newPrice = parseInt(match[2]);
-      const product = vendor.products.find(p => p.name.toLowerCase().includes(productName.toLowerCase()));
-      if (product) {
-        product.price = newPrice;
-        await vendor.save();
-        await sendMessage(vendorPhone, fromJid, `✅ Updated!\n\n*${product.name}* is now ₦${newPrice.toLocaleString()}`);
-      } else {
-        await sendMessage(vendorPhone, fromJid, `❌ Product "${productName}" not found.\n\nSay *"show my catalogue"* to see your products.`);
-      }
-    } else {
-      await sendMessage(vendorPhone, fromJid, 'Format: "Change [product name] price to [amount]"\n\nExample: "Change red ankara price to 6000"');
-    }
-    return;
-  }
-
-  if (lowerText.includes('add product') || lowerText.includes('new product')) {
-    const match = text.match(/add\s+product\s+(.+?)\s*[₦N]\s*(\d+)/i);
-    if (match) {
-      vendor.products.push({
-        name: match[1].trim(),
-        price: parseInt(match[2])
-      });
-      await vendor.save();
-      await sendMessage(vendorPhone, fromJid, `✅ Added: ${match[1].trim()} — ₦${parseInt(match[2]).toLocaleString()}`);
-    } else {
-      await sendMessage(vendorPhone, fromJid, 'Format: "Add product [name] ₦[price]"\n\nExample: "Add product Blue Lace ₦8000"');
-    }
-    return;
-  }
-
-  if (lowerText.includes('remove') || lowerText.includes('delete')) {
-    const match = text.match(/(?:remove|delete)\s+(.+)/i);
-    if (match) {
-      const productName = match[1].trim();
-      const idx = vendor.products.findIndex(p => p.name.toLowerCase().includes(productName.toLowerCase()));
-      if (idx >= 0) {
-        const removed = vendor.products.splice(idx, 1)[0];
-        await vendor.save();
-        await sendMessage(vendorPhone, fromJid, `🗑️ Removed: ${removed.name}`);
-      } else {
-        await sendMessage(vendorPhone, fromJid, `❌ Product "${productName}" not found.`);
-      }
-    }
-    return;
-  }
-
-  if (lowerText.includes('pause')) {
-    vendor.status = 'paused';
-    await vendor.save();
-    await sendMessage(vendorPhone, fromJid, '⏸️ *Store paused.*\n\nI won\'t take new orders until you say *"resume"*.');
-    return;
-  }
-
-  if (lowerText.includes('group rules') || lowerText.includes('show rules')) {
-    await sendMessage(vendorPhone, fromJid, `📋 *Group Rules*\n\n${vendor.group_rules || 'No rules set.'}\n\nReply *"edit rules"* to change.`);
-    return;
-  }
-
-  if (lowerText.includes('edit rules')) {
-    vendor.onboarding_step = 8;
-    await vendor.save();
-    await sendMessage(vendorPhone, fromJid, 'Send me your new group rules:');
-    return;
-  }
-
-  if (lowerText.includes('help') || lowerText === 'commands' || lowerText === 'menu') {
-    await sendMessage(vendorPhone, fromJid, 
-      `📖 *NaijaSales AI Commands*\n\n` +
-      `*Sales:*\n"How much sales today?"\n"Sales this week"\n\n` +
-      `*Products:*\n"Show my catalogue"\n"Change [product] price to [amount]"\n"Add product [name] ₦[price]"\n"Remove [product]"\n\n` +
-      `*Store:*\n"Pause my store"\n"Resume"\n"Show group rules"\n\n` +
-      `*Need help?* Just ask me anything! 😊`
+async function handleVendorSelfManagement(vendor, fromJid, text, lowerText, sessionPhone, msg) {
+  if (lowerText === 'help') {
+    await sendMessage(sessionPhone, fromJid, 
+      `*Store Management Commands:*\n\n` +
+      `• *products* - View your products\n` +
+      `• *add product* - Add a new product\n` +
+      `• *remove [name]* - Remove a product\n` +
+      `• *pause* - Pause your store\n` +
+      `• *resume* - Resume your store\n` +
+      `• *stats* - View sales stats\n` +
+      `• *balance* - Check payouts\n` +
+      `• *disconnect* - Disconnect WhatsApp`
     );
     return;
   }
 
-  await sendMessage(vendorPhone, fromJid, `👋 Hey *${vendor.business_name}*!\n\nWhat would you like to do?\n\nSay *"help"* for commands.`);
+  if (lowerText === 'products') {
+    if (vendor.products.length === 0) {
+      await sendMessage(sessionPhone, fromJid, `You have no products yet. Send *"add product"* to add one.`);
+      return;
+    }
+    let reply = `*Your Products:*\n\n`;
+    vendor.products.forEach((p, i) => {
+      reply += `${i+1}. ${p.name} - ₦${p.price.toLocaleString()}\n`;
+    });
+    await sendMessage(sessionPhone, fromJid, reply);
+    return;
+  }
+
+  if (lowerText === 'add product') {
+    await sendMessage(sessionPhone, fromJid, `Send a product photo with the name and price in the caption.\nExample: "Red Ankara ₦5500"`);
+    return;
+  }
+
+  if (lowerText.startsWith('remove ')) {
+    const productName = text.substring(7).trim();
+    const idx = vendor.products.findIndex(p => p.name.toLowerCase() === productName.toLowerCase());
+    if (idx >= 0) {
+      vendor.products.splice(idx, 1);
+      await vendor.save();
+      await sendMessage(sessionPhone, fromJid, `✅ *${productName}* removed.`);
+    } else {
+      await sendMessage(sessionPhone, fromJid, `❌ Product "${productName}" not found.`);
+    }
+    return;
+  }
+
+  if (lowerText === 'pause') {
+    vendor.status = 'paused';
+    await vendor.save();
+    await sendMessage(sessionPhone, fromJid, `⏸️ Store paused. Customers will see a pause message.`);
+    return;
+  }
+
+  if (lowerText === 'resume') {
+    vendor.status = 'active';
+    await vendor.save();
+    await sendMessage(sessionPhone, fromJid, `▶️ Store resumed! Customers can now order.`);
+    return;
+  }
+
+  if (lowerText === 'stats') {
+    const totalOrders = await Order.countDocuments({ vendor_phone: vendor.phone });
+    const paidOrders = await Order.countDocuments({ vendor_phone: vendor.phone, status: 'paid' });
+    const totalRevenue = await Order.aggregate([
+      { $match: { vendor_phone: vendor.phone, status: 'paid' } },
+      { $group: { _id: null, total: { $sum: '$total' } } }
+    ]);
+    const revenue = totalRevenue[0]?.total || 0;
+    
+    await sendMessage(sessionPhone, fromJid, 
+      `*Sales Stats:*\n\n` +
+      `Total Orders: ${totalOrders}\n` +
+      `Paid Orders: ${paidOrders}\n` +
+      `Total Revenue: ₦${revenue.toLocaleString()}`
+    );
+    return;
+  }
+
+  if (lowerText === 'disconnect') {
+    const session = sessions.get(sessionPhone);
+    if (session?.socket) {
+      try { session.socket.end(); } catch(e) {}
+    }
+    sessions.delete(sessionPhone);
+    vendor.auth_connected = false;
+    vendor.status = 'onboarding';
+    vendor.onboarding_step = 9;
+    await vendor.save();
+    await sendMessage(sessionPhone, fromJid, `❌ Disconnected. Reply *"reconnect"* on the admin number to link again.`);
+    return;
+  }
+
+  if (msg.message?.imageMessage && vendor.onboarding_step >= 10) {
+    const caption = msg.message.imageMessage.caption || '';
+    const priceMatch = caption.match(/[₦N]\s*(\d+(?:,\d{3})*)/);
+    const nameMatch = caption.replace(/[₦N]\s*\d+(?:,\d{3})*/, '').trim();
+    
+    if (priceMatch && nameMatch) {
+      const price = parseInt(priceMatch[1].replace(/,/g, ''));
+      vendor.products.push({
+        name: nameMatch,
+        price: price,
+        image_url: msg.message.imageMessage.url || ''
+      });
+      await vendor.save();
+      await sendMessage(sessionPhone, fromJid, `✅ *${nameMatch}* added at ₦${price.toLocaleString()}.`);
+    } else {
+      await sendMessage(sessionPhone, fromJid, `❌ Please include price in caption.\nExample: "Red Ankara ₦5500"`);
+    }
+    return;
+  }
+
+  await sendMessage(sessionPhone, fromJid, `Type *"help"* for available commands.`);
 }
 
-// ─── CUSTOMER MESSAGE HANDLER (PAYSTACK VIRTUAL ACCOUNT) ──────────
-async function handleCustomerMessage(vendor, fromJid, text, lowerText, vendorPhone, customerPhone) {
-  const cartKey = `${vendorPhone}:${customerPhone}`;
+// ─── CUSTOMER MESSAGE HANDLER ───────────────────────────────────────
+async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPhone, customerPhone) {
+  // ── FIX: Skip status/broadcast messages ──
+  if (fromJid.includes('status@broadcast')) {
+    return;
+  }
   
-  // Product selection
-  for (const product of vendor.products) {
-    const productNameLower = product.name.toLowerCase();
-    if (lowerText.includes(productNameLower) || 
-        (lowerText.includes('price') && lowerText.includes(productNameLower.split(' ')[0]))) {
-      
-      await sendMessage(vendorPhone, fromJid, 
-        `💰 *${product.name}*\n\n` +
-        `Price: ₦${product.price.toLocaleString()}\n\n` +
-        `How many do you want? Reply with a number (e.g., "2").`
-      );
-      
-      activeCarts.set(cartKey, { 
-        vendor, 
-        customerPhone, 
-        pendingProduct: product,
-        items: [],
-        step: 'quantity'
-      });
-      return;
-    }
+  const cartKey = `${vendor.phone}:${customerPhone}`;
+  
+  if (lowerText === 'hi' || lowerText === 'hello' || lowerText === 'start' || lowerText === 'menu') {
+    let menu = `👋 *Welcome to ${vendor.business_name}!*\n\n`;
+    menu += `${vendor.description}\n\n`;
+    menu += `*Our Products:*\n`;
+    vendor.products.forEach((p, i) => {
+      menu += `${i+1}. ${p.name} - ₦${p.price.toLocaleString()}\n`;
+    });
+    menu += `\nReply with a product *number* to order.\n`;
+    menu += `Or type *"help"* for assistance.`;
+    await sendMessage(sessionPhone, fromJid, menu);
+    return;
   }
 
-  // Quantity input
-  const qtyMatch = text.match(/^(\d+)$/);
-  if (qtyMatch && activeCarts.has(cartKey)) {
-    const cart = activeCarts.get(cartKey);
-    if (cart.step === 'quantity' && cart.pendingProduct) {
-      const qty = parseInt(qtyMatch[1]);
-      const product = cart.pendingProduct;
-      
-      cart.items.push({
-        name: product.name,
-        qty: qty,
-        price: product.price
+  if (lowerText === 'help') {
+    let help = `*How to Order:*\n\n`;
+    help += `1. Type *"menu"* to see products\n`;
+    help += `2. Reply with product number\n`;
+    help += `3. Confirm your order\n`;
+    help += `4. Pay into the virtual account\n`;
+    help += `5. We'll notify the vendor!\n\n`;
+    if (vendor.faqs.length > 0) {
+      help += `*FAQs:*\n`;
+      vendor.faqs.forEach((f, i) => {
+        help += `Q: ${f.q}\nA: ${f.a}\n\n`;
       });
-      cart.pendingProduct = null;
-      cart.step = 'checkout_or_continue';
-      
-      const itemTotal = qty * product.price;
-      let reply = `🛒 *Added to cart:*\n${qty}x ${product.name} = ₦${itemTotal.toLocaleString()}\n\n`;
-      
-      if (cart.items.length > 1) {
-        const total = cart.items.reduce((s, i) => s + (i.qty * i.price), 0);
-        reply += `*Cart total: ₦${total.toLocaleString()}*\n\n`;
-      }
-      
-      reply += `Reply:\n• *"checkout"* to pay\n• *"more"* to add more items\n• Product name to add another`;
-      
-      await sendMessage(vendorPhone, fromJid, reply);
-      return;
     }
+    await sendMessage(sessionPhone, fromJid, help);
+    return;
   }
 
-  // Checkout with virtual account
-  if (lowerText === 'checkout' || lowerText === 'pay' || lowerText === 'done') {
+  const productNum = parseInt(lowerText);
+  if (!isNaN(productNum) && productNum > 0 && productNum <= vendor.products.length) {
+    const product = vendor.products[productNum - 1];
+    activeCarts.set(cartKey, { product, qty: 1 });
+    
+    await sendMessage(sessionPhone, fromJid, 
+      `*${product.name}*\n` +
+      `Price: ₦${product.price.toLocaleString()}\n\n` +
+      `Reply *"buy"* to purchase, or *"cancel"* to go back.`
+    );
+    return;
+  }
+
+  if (lowerText === 'buy') {
     const cart = activeCarts.get(cartKey);
-    if (!cart || cart.items.length === 0) {
-      await sendMessage(vendorPhone, fromJid, 
-        `🛒 Your cart is empty.\n\n` +
-        `Say *"show products"* to see what we have.`
-      );
+    if (!cart) {
+      await sendMessage(sessionPhone, fromJid, `No item selected. Type *"menu"* to browse.`);
       return;
     }
-    
-    const total = cart.items.reduce((s, i) => s + (i.qty * i.price), 0);
-    
-    // Create order
+
     const order = new Order({
       vendor_phone: vendor.phone,
       customer_phone: customerPhone,
-      items: cart.items,
-      total: total,
-      status: 'pending'
+      customer_name: 'Customer',
+      items: [{ name: cart.product.name, qty: cart.qty, price: cart.product.price }],
+      total: cart.product.price * cart.qty
     });
     await order.save();
-    
-    // Create Paystack virtual account
-    const customerName = cart.customerName || `Customer ${customerPhone.slice(-4)}`;
-    const vaResult = await createVirtualAccount(order, customerName);
-    
-    if (vaResult.success) {
+
+    const va = await createVirtualAccount(order, 'Customer');
+    if (va.success) {
       order.virtual_account = {
-        account_name: vaResult.account_name,
-        account_number: vaResult.account_number,
-        bank_name: vaResult.bank_name,
-        expires_at: new Date(Date.now() + 30 * 60 * 1000) // 30 min
+        account_name: va.account_name,
+        account_number: va.account_number,
+        bank_name: va.bank_name,
+        expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000)
       };
-      order.status = 'awaiting_payment';
       await order.save();
-      
-      let itemsList = cart.items.map(i => `• ${i.qty}x ${i.name} = ₦${(i.qty * i.price).toLocaleString()}`).join('\n');
-      
-      await sendMessage(vendorPhone, fromJid, 
-        `🛒 *Order Summary*\n\n` +
-        `${itemsList}\n\n` +
-        `*Total: ₦${total.toLocaleString()}*\n\n` +
-        `*Pay via bank transfer:*\n` +
-        `🏦 Bank: ${vaResult.bank_name}\n` +
-        `👤 Name: ${vaResult.account_name}\n` +
-        `🔢 Account: ${vaResult.account_number}\n\n` +
-        `⏰ Transfer within 30 minutes.\n` +
-        `You'll get a receipt automatically once payment is confirmed.`
+
+      await sendMessage(sessionPhone, fromJid, 
+        `🛒 *Order Confirmed!*\n\n` +
+        `Item: ${cart.product.name}\n` +
+        `Total: ₦${order.total.toLocaleString()}\n\n` +
+        `*Payment Details:*\n` +
+        `Bank: ${va.bank_name}\n` +
+        `Account: ${va.account_number}\n` +
+        `Name: ${va.account_name}\n\n` +
+        `⏰ Valid for 24 hours. Pay to complete your order!`
       );
-      
-      // Notify vendor
-      await sendMessage(vendorPhone, formatJid(vendor.phone), 
-        `📦 *New Order!*\n\n` +
-        `Customer: ${customerPhone}\n` +
-        `${itemsList}\n\n` +
-        `Total: ₦${total.toLocaleString()}\n` +
-        `Status: Awaiting payment...\n` +
-        `VA: ${vaResult.account_number}`
-      );
-      
-      activeCarts.delete(cartKey);
     } else {
-      await sendMessage(vendorPhone, fromJid, 
-        `❌ Payment setup failed: ${vaResult.error}\n\n` +
-        `Please try again or contact the vendor.`
-      );
+      await sendMessage(sessionPhone, fromJid, `❌ Failed to create payment account. Please try again.`);
     }
+    activeCarts.delete(cartKey);
     return;
   }
 
-  // Continue shopping
-  if (lowerText === 'more' || lowerText === 'continue') {
-    await sendMessage(vendorPhone, fromJid, 
-      `👍 Great! What else would you like?\n\n` +
-      `Say *"show products"* to see the catalogue.`
-    );
+  if (lowerText === 'cancel') {
+    activeCarts.delete(cartKey);
+    await sendMessage(sessionPhone, fromJid, `❌ Cancelled. Type *"menu"* to browse.`);
     return;
   }
 
-  // Show products
-  if (lowerText.includes('show products') || lowerText.includes('catalogue') || lowerText.includes('products')) {
-    if (vendor.products.length === 0) {
-      await sendMessage(vendorPhone, fromJid, '📭 No products available right now. Please check back later.');
-      return;
-    }
-    let reply = `📦 *${vendor.business_name} — Catalogue*\n\n`;
-    vendor.products.forEach((p, i) => {
-      reply += `${i + 1}. ${p.name} — ₦${p.price.toLocaleString()}\n`;
-    });
-    reply += '\nReply with a product name to order.';
-    await sendMessage(vendorPhone, fromJid, reply);
-    return;
-  }
-
-  // Buy intent
-  if (lowerText.includes('buy') || lowerText.includes('order') || lowerText.includes('want') || lowerText.includes('get')) {
-    await sendMessage(vendorPhone, fromJid, 
-      `🛒 Hi! Welcome to *${vendor.business_name}*.\n\n` +
-      `What would you like to buy? Say *"show products"* to see our catalogue.`
-    );
-    return;
-  }
-
-  // FAQ matching
-  for (const faq of vendor.faqs) {
-    if (lowerText.includes(faq.q.toLowerCase().substring(0, 10))) {
-      await sendMessage(vendorPhone, fromJid, `💬 *${faq.q}*\n\n${faq.a}`);
-      return;
-    }
-  }
-
-  await sendMessage(vendorPhone, fromJid, 
-    `👋 Welcome to *${vendor.business_name}*!\n\n` +
-    `How can I help you today?\n\n` +
-    `Say *"show products"* to see what we have.`
+  await sendMessage(sessionPhone, fromJid, 
+    `I didn't understand that. Type *"menu"* to see products or *"help"* for assistance.`
   );
 }
 
-// ─── PAYSTACK WEBHOOK HANDLER ───────────────────────────────────────
+// ─── PAYSTACK WEBHOOK ───────────────────────────────────────────────
 app.post('/webhook/paystack', async (req, res) => {
   const signature = req.headers['x-paystack-signature'];
-  const payload = req.body;
-  
-  // Verify signature using secret key
-  const hash = crypto
-    .createHmac('sha512', PAYSTACK_WEBHOOK_SECRET)
-    .update(payload)
-    .digest('hex');
+  const hash = crypto.createHmac('sha512', PAYSTACK_WEBHOOK_SECRET).update(req.body).digest('hex');
   
   if (hash !== signature) {
-    console.log('❌ Invalid webhook signature');
-    return res.status(401).send('Unauthorized');
+    return res.status(400).send('Invalid signature');
   }
-  
-  const event = JSON.parse(payload);
-  console.log('📡 Paystack webhook:', event.event, event.data?.reference);
-  
-  res.status(200).send('OK');
-  
-  if (event.event === 'charge.success') {
-    const { reference, amount, customer } = event.data;
-    
-    // Find order by virtual account or reference
-    const order = await Order.findOne({ 
-      $or: [
-        { paystack_ref: reference },
-        { 'virtual_account.account_number': customer?.account_number }
-      ]
-    });
-    
-    if (!order) {
-      console.log('⚠️ Order not found for ref:', reference);
-      return;
-    }
-    
-    if (order.status === 'paid') {
-      console.log('Order already paid:', order._id);
-      return;
-    }
-    
-    // Update order
-    order.status = 'paid';
-    order.paid_at = new Date();
-    order.paystack_ref = reference;
-    await order.save();
-    
-    const vendor = await Vendor.findOne({ phone: order.vendor_phone });
-    
-    // Commission (5%)
-    const commissionRate = 0.05;
-    const commission = Math.floor(order.total * commissionRate);
-    const vendorAmount = order.total - commission;
-    
-    // Generate receipt
-    const receiptId = `NS-${order._id.toString().slice(-8).toUpperCase()}`;
-    const receiptText = 
-      `🧾 *PAYMENT RECEIPT*\n\n` +
-      `Receipt No: #${receiptId}\n` +
-      `Date: ${new Date().toLocaleString('en-NG')}\n` +
-      `Vendor: ${vendor?.business_name || 'NaijaSales'}\n\n` +
-      `*Items:*\n` +
-      order.items.map(i => `• ${i.qty}x ${i.name} @ ₦${i.price.toLocaleString()} = ₦${(i.qty * i.price).toLocaleString()}`).join('\n') +
-      `\n\n*Total Paid: ₦${order.total.toLocaleString()}*\n` +
-      `Payment Ref: ${reference}\n\n` +
-      `Thank you for shopping with us! 🎉`;
-    
-    // Send receipt to customer
-    await sendMessage(order.vendor_phone, formatJid(order.customer_phone), receiptText);
-    
-    // Notify vendor
-    await sendMessage(order.vendor_phone, formatJid(order.vendor_phone), 
-      `💰 *Payment Received!*\n\n` +
-      `Order: #${receiptId}\n` +
-      `Customer: ${order.customer_phone}\n` +
-      `Amount: ₦${order.total.toLocaleString()}\n` +
-      `Commission: ₦${commission.toLocaleString()}\n` +
-      `You receive: ₦${vendorAmount.toLocaleString()}\n\n` +
-      `Transfer initiated to your bank account.`
-    );
-    
-    // Transfer to vendor
-    const transferRef = `TRF_${order._id}_${Date.now()}`;
-    const transferResult = await transferToVendor(
-      vendor, 
-      vendorAmount * 100, 
-      transferRef,
-      `Order #${receiptId} - ${vendor?.business_name}`
-    );
-    
-    if (transferResult.status) {
-      order.paystack_transfer_ref = transferRef;
-      order.status = 'fulfilled';
-      await order.save();
-      console.log(`✅ Transfer initiated: ${transferRef}`);
-    } else {
-      console.log(`⚠️ Transfer failed: ${transferResult.message}`);
-    }
-    
-    // Notify admin
-    await sendMessage(ADMIN_PHONE, formatJid(ADMIN_PHONE), 
-      `📊 *Commission Alert*\n\n` +
-      `Order: #${receiptId}\n` +
-      `Vendor: ${vendor?.business_name} (${order.vendor_phone})\n` +
-      `Total: ₦${order.total.toLocaleString()}\n` +
-      `Commission (5%): ₦${commission.toLocaleString()}`
-    );
-  }
-  
-  if (event.event === 'transfer.success') {
-    const { reference, recipient, amount } = event.data;
-    console.log(`✅ Transfer success: ${reference} → ${recipient.account_number}`);
-  }
-  
-  if (event.event === 'transfer.failed') {
-    const { reference, reason } = event.data;
-    console.log(`❌ Transfer failed: ${reference} — ${reason}`);
-  }
-});
 
-// Fallback callback
-app.get('/paystack/callback', async (req, res) => {
-  const { reference, trxref } = req.query;
-  const ref = reference || trxref;
-  
-  if (!ref) {
-    return res.status(400).send('Missing reference');
-  }
-  
-  const verification = await verifyTransaction(ref);
-  
-  if (verification.status && verification.data.status === 'success') {
-    const order = await Order.findOne({ paystack_ref: ref });
-    if (order && order.status !== 'paid') {
+  const event = JSON.parse(req.body);
+  console.log('🔔 Paystack webhook:', event.event);
+
+  if (event.event === 'charge.success') {
+    const reference = event.data.reference;
+    const order = await Order.findOne({ paystack_ref: reference });
+    
+    if (order) {
       order.status = 'paid';
       order.paid_at = new Date();
       await order.save();
-      // Trigger receipt (same logic as webhook)
+
+      const vendor = await Vendor.findOne({ phone: order.vendor_phone });
+      if (vendor) {
+        const commissionRate = 0.05;
+        const amountKobo = Math.floor(order.total * (1 - commissionRate) * 100);
+        const transferRef = `tf_${Date.now()}_${order._id}`;
+        
+        const transfer = await transferToVendor(vendor, amountKobo, transferRef, `Order payment - ${order.customer_phone}`);
+        
+        if (transfer.status) {
+          order.paystack_transfer_ref = transferRef;
+          await order.save();
+          
+          await sendMessage(vendor.phone, formatJid(vendor.phone), 
+            `🎉 *New Order Paid!*\n\n` +
+            `Customer: ${order.customer_phone}\n` +
+            `Amount: ₦${order.total.toLocaleString()}\n` +
+            `Payout: ₦${(amountKobo / 100).toLocaleString()}\n` +
+            `Transfer Ref: ${transferRef}`
+          );
+        }
+      }
+
+      await sendMessage(order.vendor_phone, formatJid(order.customer_phone), 
+        `✅ *Payment Received!*\n\n` +
+        `Your order has been confirmed.\n` +
+        `The vendor will process it shortly.`
+      );
     }
-    res.send('✅ Payment successful! Check your WhatsApp for receipt.');
-  } else {
-    res.send('❌ Payment failed or pending. Please try again.');
   }
+
+  res.status(200).send('OK');
 });
 
 // ─── EXPRESS ROUTES ─────────────────────────────────────────────────
-app.get('/health', async (req, res) => {
-  const activeSessions = Array.from(sessions.entries())
-    .filter(([_, s]) => s.connected)
-    .map(([phone, s]) => ({ phone, isAdmin: s.isAdmin }));
-  
-  const vendorCount = await Vendor.countDocuments();
-  const activeVendors = await Vendor.countDocuments({ status: 'active' });
-  const todaySales = await Order.aggregate([
-    { $match: { status: 'paid', paid_at: { $gte: new Date(new Date().setHours(0,0,0,0)) } } },
-    { $group: { _id: null, total: { $sum: '$total' } } }
-  ]);
-  
-  res.json({
+app.get('/', (req, res) => {
+  res.json({ status: 'NaijaSales AI is running', connectedSessions: sessions.size });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
     db: dbReady,
-    adminConnected: sessions.get(ADMIN_PHONE)?.connected || false,
-    activeSessions: activeSessions.length,
-    sessions: activeSessions,
-    vendors: { total: vendorCount, active: activeVendors },
-    todaySales: todaySales[0]?.total || 0,
+    sessions: Array.from(sessions.keys()),
     uptime: process.uptime()
   });
 });
 
-app.get('/vendors', async (req, res) => {
-  const vendors = await Vendor.find().select('-__v').sort({ created_at: -1 });
-  res.json(vendors);
-});
+// ─── KEEP-ALIVE PING (Prevents Render from sleeping) ─────────────────
+setInterval(() => {
+  if (WEBHOOK_BASE && WEBHOOK_BASE !== `http://localhost:${process.env.PORT || 3000}`) {
+    axios.get(`${WEBHOOK_BASE}/health`)
+      .then(() => console.log('💓 Keep-alive ping sent'))
+      .catch(err => console.log('⚠️ Keep-alive ping failed:', err.message));
+  }
+}, 5 * 60 * 1000);
 
-app.get('/orders', async (req, res) => {
-  const { vendor_phone, status } = req.query;
-  const filter = {};
-  if (vendor_phone) filter.vendor_phone = cleanPhone(vendor_phone);
-  if (status) filter.status = status;
-  const orders = await Order.find(filter).sort({ created_at: -1 });
-  res.json(orders);
-});
-
-// ─── STARTUP ──────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, async () => {
-  console.log(`🚀 NaijaSales AI running on port ${PORT}`);
-  console.log(`📱 Admin number: ${ADMIN_PHONE}`);
-  console.log(`🔗 Webhook URL: ${WEBHOOK_BASE}/webhook/paystack`);
+// ─── AUTO-RECONNECT ALL SESSIONS ON STARTUP ─────────────────────────
+async function reconnectAllSessions() {
+  console.log('🔄 Checking for sessions to reconnect...');
   
-  console.log('🔌 Starting admin session...');
-const adminResult = await createSession(ADMIN_PHONE, true);
-
-if (adminResult.alreadyConnected) {
-  console.log('✅ Admin session already connected');
-} else if (adminResult.success) {
-  // Wait up to 60 seconds for connection
-  let attempts = 0;
-  const maxAttempts = 12;
+  if (ADMIN_PHONE && !sessions.get(cleanPhone(ADMIN_PHONE))?.connected) {
+    console.log('🔑 Reconnecting admin session...');
+    await createSession(ADMIN_PHONE, true);
+  }
   
-  const checkConnection = setInterval(() => {
-    const session = sessions.get(ADMIN_PHONE);
-    attempts++;
-    
-    if (session?.connected) {
-      clearInterval(checkConnection);
-      console.log('✅ Admin session connected');
-    } else if (attempts >= maxAttempts) {
-      clearInterval(checkConnection);
-      console.log('⚠️ Admin session pairing pending — enter code on your phone');
-    }
-  }, 5000);
-  
-  // Give immediate feedback
-  console.log(`📱 Admin pairing code: ${adminResult.code}`);
-  console.log('👉 Enter this code in WhatsApp → Settings → Linked Devices → Link with Phone Number');
-} else {
-  console.error('❌ Admin session failed:', adminResult.error);
-}
-  
-  console.log('🔄 Restoring vendor sessions...');
-  const activeVendors = await Vendor.find({ status: 'active', auth_connected: true });
+  const activeVendors = await Vendor.find({ auth_connected: true });
   for (const vendor of activeVendors) {
-    console.log(`🔄 Restoring ${vendor.phone}...`);
-    await createSession(vendor.phone, false);
-    await new Promise(r => setTimeout(r, 2000));
+    if (!sessions.get(vendor.phone)?.connected) {
+      console.log(`🔄 Reconnecting vendor ${vendor.phone}...`);
+      await createSession(vendor.phone, false);
+      await new Promise(r => setTimeout(r, 3000));
+    }
   }
-  console.log('✅ Startup complete');
-});
+}
 
-process.on('SIGINT', async () => {
-  console.log('\n🛑 Shutting down...');
-  for (const [phone, session] of sessions) {
-    try { session.socket?.end(); } catch(e) {}
+// ─── START SERVER ─────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📱 Admin: ${ADMIN_PHONE}`);
+  
+  if (ADMIN_PHONE) {
+    console.log('🔑 Starting admin session...');
+    await createSession(ADMIN_PHONE, true);
   }
-  await mongoose.connection.close();
-  process.exit(0);
+  
+  setTimeout(reconnectAllSessions, 5000);
 });

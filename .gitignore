@@ -1,6 +1,6 @@
 node_modules/
 .env
-test_auth/
-test_auth2/
 *.log
+auth_info/
+qr-code.png
 .DS_Store
