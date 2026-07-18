@@ -187,13 +187,18 @@ async function transferToVendor(vendor, amountKobo, reference, reason) {
 async function createSession(phone, isAdmin = false, requesterJid = null) {
   const clean = cleanPhone(phone);
 
+  // ── FIX: Properly clean up existing session ──
   if (sessions.has(clean)) {
     const existing = sessions.get(clean);
-    if (existing.connected) {
-      return { success: true, alreadyConnected: true };
-    }
-    try { existing.socket?.end(); } catch(e) {}
+    console.log(`🧹 Cleaning up existing session for ${clean}`);
+    
+    try { 
+      existing.socket?.end(); 
+      existing.socket?.ev.removeAllListeners();
+    } catch(e) {}
+    
     sessions.delete(clean);
+    await new Promise(r => setTimeout(r, 1000));
   }
 
   try {
@@ -203,13 +208,11 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
     let state, saveCreds;
     
     if (IS_RENDER) {
-      // Use MongoDB auth state on Render (persists across deploys)
       console.log(`☁️ Using MongoDB auth state for ${clean}`);
       const mongoAuth = await useMongoDBAuthState(clean);
       state = mongoAuth.state;
       saveCreds = mongoAuth.saveCreds;
     } else {
-      // Use file-based auth on local/Termux
       console.log(`💾 Using file auth state for ${clean}`);
       const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
       if (!fs.existsSync(sessionDir)) {
@@ -253,6 +256,12 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
       sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
+        // ── FIX: Ignore undefined states ──
+        if (connection === undefined && !qr) {
+          console.log(`[${clean}] Connection state undefined, waiting...`);
+          return;
+        }
+        
         console.log(`[${clean}] Connection update:`, { connection, hasQR: !!qr });
         
         // ── GENERATE AND SEND QR CODE ──
@@ -266,7 +275,6 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
               type: 'png'
             });
             
-            // Save QR locally for reference (local only)
             if (!IS_RENDER) {
               const qrPath = `${BASE_DIR}/auth_info/${clean}/qr-code.png`;
               fs.writeFileSync(qrPath, qrBuffer);
@@ -324,6 +332,36 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
           
           console.log(`❌ [${clean}] Disconnected (code: ${statusCode}). Reconnect: ${shouldReconnect}`);
 
+          // ── FIX: Handle 401 Unauthorized ──
+          if (statusCode === 401) {
+            console.log(`🚫 [${clean}] Session unauthorized. Clearing auth...`);
+            sessionData.resolved = true;
+            sessions.delete(clean);
+            
+            if (IS_RENDER) {
+              await mongoose.model('AuthState').deleteOne({ phone: clean });
+            } else {
+              const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
+              if (fs.existsSync(sessionDir)) {
+                fs.rmSync(sessionDir, { recursive: true, force: true });
+              }
+            }
+            
+            if (!isAdmin) {
+              await Vendor.updateOne(
+                { phone: clean },
+                { $set: { auth_connected: false, status: 'onboarding', onboarding_step: 9 } }
+              );
+              const adminSession = sessions.get(cleanPhone(ADMIN_PHONE));
+              if (adminSession?.socket && requesterJid) {
+                await adminSession.socket.sendMessage(requesterJid, {
+                  text: `❌ Your WhatsApp was unlinked. Please reply *"reconnect"* to link again.`
+                });
+              }
+            }
+            return;
+          }
+
           if (shouldReconnect) {
             if (sessionData.reconnectAttempts < sessionData.maxReconnects) {
               sessionData.reconnectAttempts++;
@@ -352,17 +390,16 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
               }
             }
           } else {
-            // Logged out - clear auth
             sessionData.resolved = true;
             sessions.delete(clean);
             
-            // Clear from MongoDB on Render, files on local
             if (IS_RENDER) {
               await mongoose.model('AuthState').deleteOne({ phone: clean });
-              console.log(`🗑️ Cleared MongoDB auth for ${clean}`);
             } else {
               const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
-              fs.rmSync(sessionDir, { recursive: true, force: true });
+              if (fs.existsSync(sessionDir)) {
+                fs.rmSync(sessionDir, { recursive: true, force: true });
+              }
             }
             
             if (!isAdmin) {
@@ -375,9 +412,11 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
         }
       });
       
-      // ── 3 minute timeout ──
+      // ── FIX: Only timeout if not connected ──
       setTimeout(() => {
-        if (!sessionData.resolved) {
+        if (!sessionData.resolved && !sessionData.connected) {
+          console.log(`⏰ [${clean}] QR timeout reached`);
+          sessionData.resolved = true;
           resolve({ success: false, error: 'Timeout - QR code expired. Please try again.' });
         }
       }, 180000);
@@ -391,7 +430,6 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
       }
     });
 
-    // If already authenticated, skip QR
     if (state.creds?.me?.id) {
       return { success: true, alreadyConnected: true };
     }
@@ -465,11 +503,18 @@ async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
 // ─── ADMIN HANDLER ──────────────────────────────────────────────────
 async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone, msg) {
   
-  if (fromJid.endsWith('@g.us')) {
-    console.log(`⏸️ Admin handler ignoring group message from ${sender}`);
+  // ── Skip empty messages ──
+  if (!text || text.trim().length === 0) {
     return;
   }
   
+  // ── Skip newsletters, broadcasts, groups ──
+  if (fromJid.includes('@newsletter') || fromJid.includes('@broadcast') || fromJid.endsWith('@g.us')) {
+    console.log(`⏸️ Ignoring non-DM from ${sender}`);
+    return;
+  }
+  
+  // ── COMMANDS (always respond) ──
   if (lowerText === '/vendors' || lowerText === 'vendors') {
     const vendors = await Vendor.find().sort({ created_at: -1 }).limit(20);
     let reply = `📋 *All Vendors (${vendors.length})*\n\n`;
@@ -494,38 +539,46 @@ async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone, 
     return;
   }
 
+  // ── CHECK IF EXISTING VENDOR ──
   let vendor = await Vendor.findOne({ phone: sender });
 
-  if (!vendor) {
-    if (lowerText.includes('register') || lowerText.includes('start') || lowerText.includes('sell')) {
-      vendor = new Vendor({ phone: sender, onboarding_step: 0 });
-      await vendor.save();
-      await sendMessage(adminPhone, fromJid, 
-        `👋 *Welcome to NaijaSales AI!*\n\n` +
-        `I'm your personal sales assistant. I'll help you sell your products 24/7 on WhatsApp.\n\n` +
-        `Reply *"start"* to begin setup.`
-      );
-      vendor.onboarding_step = 0.5;
-      await vendor.save();
-    } else {
-      await sendMessage(adminPhone, fromJid, 
-        `👋 Hi! Want to start selling on WhatsApp?\n\n` +
-        `Reply *"register"* to get started.`
-      );
+  if (vendor) {
+    // Existing vendor — handle normally
+    if (vendor.status === 'onboarding') {
+      await handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, msg);
+      return;
     }
+    
+    // Active vendor — minimal response
+    await sendMessage(adminPhone, fromJid, 
+      `👋 *${vendor.business_name}*, your store is active!\n\n` +
+      `To manage your store, message your own WhatsApp number: *${vendor.phone}*\n\n` +
+      `Or type *"help"* for commands.`
+    );
     return;
   }
 
-  if (vendor.status === 'onboarding') {
-    await handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, msg);
+  // ── NEW USER — ONLY RESPOND TO TRIGGER WORDS ──
+  const triggerWords = ['register', 'start', 'sell', 'onboard', 'setup', 'join'];
+  const hasTrigger = triggerWords.some(word => lowerText.includes(word));
+  
+  if (hasTrigger) {
+    // Create new vendor and start onboarding
+    vendor = new Vendor({ phone: sender, onboarding_step: 0 });
+    await vendor.save();
+    await sendMessage(adminPhone, fromJid, 
+      `👋 *Welcome to NaijaSales AI!*\n\n` +
+      `I'm your personal sales assistant. I'll help you sell your products 24/7 on WhatsApp.\n\n` +
+      `Reply *"start"* to begin setup.`
+    );
+    vendor.onboarding_step = 0.5;
+    await vendor.save();
     return;
   }
-
-  await sendMessage(adminPhone, fromJid, 
-    `👋 *${vendor.business_name}*, your store is active!\n\n` +
-    `To manage your store, message your own WhatsApp number: *${vendor.phone}*\n\n` +
-    `Or type *"help"* for commands.`
-  );
+  
+  // ── SILENT FOR EVERYTHING ELSE ──
+  console.log(`🔇 Silent: Ignoring message from ${sender}: "${text.substring(0, 30)}"`);
+  // DO NOT SEND ANY MESSAGE
 }
 
 // ─── ONBOARDING FLOW ────────────────────────────────────────────────
@@ -678,6 +731,22 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
 
     case 9:
       if (lowerText === 'reconnect') {
+        // ── FIX: Clear old auth before reconnecting ──
+        console.log(`🧹 Clearing old auth for ${vendor.phone} before reconnect...`);
+        
+        if (IS_RENDER) {
+          await mongoose.model('AuthState').deleteOne({ phone: cleanPhone(vendor.phone) });
+        } else {
+          const sessionDir = `${BASE_DIR}/auth_info/${cleanPhone(vendor.phone)}`;
+          if (fs.existsSync(sessionDir)) {
+            fs.rmSync(sessionDir, { recursive: true, force: true });
+          }
+        }
+        
+        sessions.delete(cleanPhone(vendor.phone));
+        
+        await sendMessage(adminPhone, fromJid, `🔑 Generating fresh QR code... Please wait.`);
+        
         const result = await createSession(vendor.phone, false, fromJid);
         if (result.success) {
           await sendMessage(adminPhone, fromJid, `✅ Reconnected!`);
@@ -1000,7 +1069,10 @@ setInterval(() => {
 // ─── CONNECTION MONITOR (Heartbeat to keep WA alive) ─────────────────
 setInterval(async () => {
   for (const [phone, session] of sessions.entries()) {
-    if (!session.connected) continue;
+    if (!session.connected || !session.socket?.ws) {
+      console.log(`⏸️ Skipping heartbeat for ${phone} (not connected)`);
+      continue;
+    }
     
     try {
       await session.socket.sendPresenceUpdate('available');
@@ -1016,6 +1088,17 @@ setInterval(async () => {
     }
   }
 }, 60000);
+
+// ─── ADMIN SESSION WATCHDOG ─────────────────────────────────────────
+setInterval(async () => {
+  const adminClean = cleanPhone(ADMIN_PHONE);
+  const adminSession = sessions.get(adminClean);
+  
+  if (!adminSession || (!adminSession.connected && !adminSession.resolved)) {
+    console.log('👀 Admin session watchdog: reconnecting...');
+    await createSession(ADMIN_PHONE, true);
+  }
+}, 30000);
 
 // ─── AUTO-RECONNECT ALL SESSIONS ON STARTUP ─────────────────────────
 async function reconnectAllSessions() {
