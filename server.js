@@ -266,7 +266,7 @@ async function createSession(phone, isAdmin = false) {
 
     const sock = makeWASocket({
       auth: state,
-      printQRInTerminal: false,
+      printQRInTerminal: true,
       browser: isAdmin ? ['NaijaSales AI', 'Admin', '1.0'] : ['Chrome (Linux)', '', ''],
       generateHighQualityLinkPreview: true,
       syncFullHistory: false,
