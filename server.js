@@ -139,11 +139,6 @@ function formatDisplayNumber(phone) {
   return clean;
 }
 
-function stripDeviceId(jid) {
-  // Remove WhatsApp device ID suffix like :1, :2, :3 from JID before @s.whatsapp.net
-  return jid.split('@')[0].split(':')[0];
-}
-
 async function sendMessage(fromPhone, toJid, text) {
   const session = sessions.get(fromPhone);
   if (!session?.socket) {
@@ -355,7 +350,8 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
       qrSent: false,
       resolved: false,
       reconnectAttempts: 0,
-      maxReconnects: 10
+      maxReconnects: 10,
+      pairingStable: false
     };
     sessions.set(clean, sessionData);
 
@@ -363,6 +359,7 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
 
     const connectionPromise = new Promise((resolve) => {
       let qrTimeoutId = null;
+      let stabilityTimeoutId = null;
       
       sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -427,7 +424,6 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
           }
           
           sessionData.connected = true;
-          sessionData.resolved = true;
           sessionData.reconnectAttempts = 0;
           console.log(`✅ [${clean}] CONNECTED`);
           
@@ -435,14 +431,24 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
             await Vendor.updateOne({ phone: clean }, { $set: { auth_connected: true } });
           }
 
-          // Send congratulations to vendor via admin session
           if (!isAdmin && requesterJid) {
-            const vendor = await Vendor.findOne({ phone: clean });
-            if (vendor) {
-              const displayPhone = formatDisplayNumber(vendor.phone);
-              const adminSession = sessions.get(cleanPhone(ADMIN_PHONE));
-              if (adminSession?.socket) {
-                await adminSession.socket.sendMessage(requesterJid, {
+            console.log(`[${clean}] Waiting 8 seconds for pairing to stabilize...`);
+            
+            stabilityTimeoutId = setTimeout(async () => {
+              try {
+                const currentSession = sessions.get(clean);
+                if (!currentSession?.connected) {
+                  console.log(`⏸️ [${clean}] Session disconnected during stability wait, skipping congratulations`);
+                  return;
+                }
+                
+                const vendor = await Vendor.findOne({ phone: clean });
+                if (!vendor) return;
+                
+                const displayPhone = formatDisplayNumber(vendor.phone);
+                const selfJid = formatJid(vendor.phone);
+                
+                await sock.sendMessage(selfJid, {
                   text: `🎉 *Congratulations ${vendor.business_name}!*\n\n` +
                     `Your WhatsApp store is now *LIVE*! 🚀\n\n` +
                     `*What happens now:*\n` +
@@ -454,8 +460,17 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
                     `Type *"help"* for commands.\n\n` +
                     `${IS_TEST_MODE ? '⚠️ Test mode: Payments are simulated. Switch to live keys for real transactions.' : ''}`
                 });
+                console.log(`✅ Congratulations sent via vendor session ${clean} to ${selfJid}`);
+                
+                sessionData.pairingStable = true;
+                sessionData.resolved = true;
+              } catch (err) {
+                console.error(`❌ Failed to send congratulations via vendor session:`, err.message);
+                sessionData.resolved = true;
               }
-            }
+            }, 8000);
+          } else {
+            sessionData.resolved = true;
           }
           
           resolve({ success: true });
@@ -463,13 +478,29 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
         
         if (connection === 'close') {
           sessionData.connected = false;
+          
+          if (stabilityTimeoutId) {
+            clearTimeout(stabilityTimeoutId);
+            stabilityTimeoutId = null;
+          }
+          
           const statusCode = lastDisconnect?.error?.output?.statusCode;
           
           if (statusCode === 515) {
-            console.log(`🔄 [${clean}] Stream error (515), restarting silently...`);
+            console.log(`🔄 [${clean}] Stream error (515), will retry with existing auth...`);
             if (qrTimeoutId) { clearTimeout(qrTimeoutId); qrTimeoutId = null; }
-            sessions.delete(clean);
-            setTimeout(() => createSession(clean, isAdmin, requesterJid), 2000);
+            
+            sessionData.resolved = false;
+            
+            try { sock.end(); } catch(e) {}
+            
+            const delay = sessionData.pairingStable ? 5000 : 10000;
+            console.log(`[${clean}] Waiting ${delay/1000}s before reconnect...`);
+            
+            setTimeout(() => {
+              console.log(`🔄 [${clean}] Reconnecting after 515...`);
+              createSession(clean, isAdmin, requesterJid);
+            }, delay);
             return;
           }
           
@@ -583,11 +614,31 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
 
     sock.ev.on('messages.upsert', async (m) => {
       if (m.type !== 'notify') return;
+      
+      const currentSession = sessions.get(clean);
+      if (currentSession && !currentSession.pairingStable && !currentSession.isAdmin) {
+        if (m.messages.length > 0) {
+          const firstMsg = m.messages[0];
+          console.log(`[${clean}] ⏸️ Ignoring message during pairing stabilization: ${firstMsg.key.remoteJid}`);
+        }
+        return;
+      }
+      
       for (const msg of m.messages) {
-        // Allow self-messages for vendor management
-        // Only skip if it's truly fromMe AND not a self-chat
-        const isSelfChat = msg.key.remoteJid === `${clean}@s.whatsapp.net`;
-        if (msg.key.fromMe && !isSelfChat) continue;
+        const selfJid = `${clean}@s.whatsapp.net`;
+        const remoteJid = msg.key.remoteJid || '';
+        const senderJid = msg.key.participant || remoteJid;
+        const remoteJidBase = remoteJid.split(':')[0];
+        const senderJidBase = senderJid.split(':')[0];
+        const senderPhone = cleanPhone(senderJidBase.split('@')[0]);
+        const isSelfChat = remoteJidBase === selfJid || senderPhone === clean;
+        
+        console.log(`[${clean}] Msg check: fromMe=${msg.key.fromMe}, remoteJid=${remoteJid}, sender=${senderJid}, senderPhone=${senderPhone}, isSelfChat=${isSelfChat}`);
+        
+        if (msg.key.fromMe && !isSelfChat) {
+          console.log(`[${clean}] Skipping non-self fromMe message from ${senderJid}`);
+          continue;
+        }
         
         await handleIncomingMessage(clean, msg, isAdmin);
       }
@@ -610,23 +661,18 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
 async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
   const fromJid = msg.key.remoteJid;
   const isGroup = fromJid.endsWith('@g.us');
-  
-  // FIX #1: Strip device ID suffix (:1, :2, etc.) from participant JID
-  // This was causing senderClean to not match sessionPhone for self-messages
-  const senderJid = msg.key.participant || msg.key.remoteJid;
-  const senderClean = cleanPhone(stripDeviceId(senderJid));
-  
+  const senderJid = msg.key.participant || fromJid;
+  const senderClean = cleanPhone(senderJid.split('@')[0].split(':')[0]);
   const text = getMessageText(msg);
   const lowerText = text.toLowerCase().trim();
 
-  console.log(`📩 [${sessionPhone}] ${isAdminSession ? 'ADMIN' : 'VENDOR'} | From: ${senderClean} | Self: ${senderClean === sessionPhone} | Group: ${isGroup} | "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+  console.log(`📩 [${sessionPhone}] ${isAdminSession ? 'ADMIN' : 'VENDOR'} | From: ${senderClean} | Self: ${senderClean === sessionPhone} | Group: ${isGroup} | Text: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
 
   if (!dbReady) {
     console.log('⚠️ DB not ready');
     return;
   }
 
-  // ── Group messages ──
   if (isGroup && !isAdminSession) {
     const vendor = await Vendor.findOne({ phone: sessionPhone });
     if (!vendor || vendor.status !== 'active') {
@@ -641,20 +687,17 @@ async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
     return;
   }
 
-  // ── Admin DMs ──
   if (isAdminSession) {
     await handleAdminMessage(senderClean, fromJid, text, lowerText, sessionPhone, msg);
     return;
   }
 
-  // ── Vendor session DMs ──
   const vendor = await Vendor.findOne({ phone: sessionPhone });
   if (!vendor) {
     console.log(`⚠️ No vendor found for session ${sessionPhone}`);
     return;
   }
 
-  // Vendor messaging themselves → self-management
   if (senderClean === sessionPhone) {
     console.log(`🔧 Vendor self-management: ${senderClean}`);
     const handled = await handleVendorCommands(vendor, fromJid, text, lowerText, sessionPhone, msg);
@@ -664,7 +707,6 @@ async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
     return;
   }
 
-  // Customer messaging vendor → customer handler
   if (vendor.status === 'active') {
     await handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPhone, senderClean);
     return;
@@ -687,7 +729,6 @@ async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone, 
     return;
   }
   
-  // ── Admin commands ──
   if (lowerText === '/vendors' || lowerText === 'vendors') {
     const vendors = await Vendor.find().sort({ created_at: -1 }).limit(20);
     let reply = `📋 *All Vendors (${vendors.length})*\n\n`;
@@ -707,27 +748,22 @@ async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone, 
       return;
     }
     const salesCount = await Order.countDocuments({ vendor_phone: vendor.phone, status: 'paid' });
-    let reply = `👤 *${vendor.business_name}*\nPhone: ${vendor.phone}\nStatus: ${vendor.status}\nConnected: ${vendor.auth_connected ? '✅' : '❌'}\nProducts: ${vendor.products.length}\nPaid Orders: ${salesCount}\n`;
+    let reply = `👤 *${vendor.business_name}*\nPhone: ${vendor.phone}\nStatus: ${v.status}\nConnected: ${v.auth_connected ? '✅' : '❌'}\nProducts: ${vendor.products.length}\nPaid Orders: ${salesCount}\n`;
     await sendMessage(adminPhone, fromJid, reply);
     return;
   }
 
-  // ── Check if this sender is an existing vendor ──
   let vendor = await Vendor.findOne({ phone: sender });
 
   if (vendor) {
-    // Vendor exists — if onboarding, continue flow
     if (vendor.status === 'onboarding') {
       await handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, msg);
       return;
     }
     
-    // FIX #2: Active vendor messaging admin → handle store commands here too
-    // AND route "help" properly instead of sending generic reminder
     const handled = await handleVendorCommands(vendor, fromJid, text, lowerText, adminPhone, msg);
     if (handled) return;
     
-    // If not a recognized command, remind them they can use their own number
     const displayPhone = formatDisplayNumber(vendor.phone);
     await sendMessage(adminPhone, fromJid, 
       `👋 *${vendor.business_name}*, your store is active!\n\n` +
@@ -738,7 +774,6 @@ async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone, 
     return;
   }
 
-  // ── New user — only respond to trigger words ──
   const triggerWords = ['register', 'start', 'sell', 'onboard', 'setup', 'join'];
   const hasTrigger = triggerWords.some(word => lowerText.includes(word));
   
@@ -755,7 +790,6 @@ async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone, 
     return;
   }
   
-  // Silent for everything else
   console.log(`🔇 Silent: Ignoring message from ${sender}: "${text.substring(0, 30)}"`);
 }
 
@@ -799,6 +833,12 @@ async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPho
 
   if (lowerText === 'add product') {
     await sendMessage(sessionPhone, fromJid, `Send a product photo with the name and price in the caption.\nExample: "Red Ankara ₦5500"`);
+    return true;
+  }
+
+  // ── FIX: Handle "done" after adding products ──
+  if (lowerText === 'done') {
+    await sendMessage(sessionPhone, fromJid, `✅ Product adding complete. Type *"products"* to view your catalog.`);
     return true;
   }
 
@@ -931,10 +971,13 @@ async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPho
     return true;
   }
 
+  // ── FIX: Support # and $ in price matching ──
   if (msg.message?.imageMessage) {
     const caption = msg.message.imageMessage.caption || '';
-    const priceMatch = caption.match(/[₦N]\s*(\d+(?:,\d{3})*)/);
-    const nameMatch = caption.replace(/[₦N]\s*\d+(?:,\d{3})*/, '').trim();
+    // ── FIX: Regex now matches ₦, N, #, and $ symbols ──
+    const priceMatch = caption.match(/[₦N#$]\s*(\d+(?:,\d{3})*)/);
+    // ── FIX: Remove all price symbols from caption to get name ──
+    const nameMatch = caption.replace(/[₦N#$]\s*\d+(?:,\d{3})*/, '').trim();
     
     if (priceMatch && nameMatch) {
       const price = parseInt(priceMatch[1].replace(/,/g, ''));
@@ -944,14 +987,13 @@ async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPho
         image_url: msg.message.imageMessage.url || ''
       });
       await vendor.save();
-      await sendMessage(sessionPhone, fromJid, `✅ *${nameMatch}* added at ₦${price.toLocaleString()}.`);
+      await sendMessage(sessionPhone, fromJid, `✅ *${nameMatch}* added at ₦${price.toLocaleString()}. Send another or type *"done"*.`);
     } else {
-      await sendMessage(sessionPhone, fromJid, `❌ Please include price in caption.\nExample: "Red Ankara ₦5500"`);
+      await sendMessage(sessionPhone, fromJid, `❌ Please include price in caption.\nExample: "Red Ankara ₦5500" or "Red Ankara #5500"`);
     }
     return true;
   }
 
-  // Not a recognized command
   return false;
 }
 
@@ -1074,8 +1116,9 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
         );
       } else if (msg.message?.imageMessage) {
         const caption = msg.message.imageMessage.caption || '';
-        const priceMatch = caption.match(/[₦N]\s*(\d+(?:,\d{3})*)/);
-        const nameMatch = caption.replace(/[₦N]\s*\d+(?:,\d{3})*/, '').trim();
+        // ── FIX: Same regex fix for onboarding product photos ──
+        const priceMatch = caption.match(/[₦N#$]\s*(\d+(?:,\d{3})*)/);
+        const nameMatch = caption.replace(/[₦N#$]\s*\d+(?:,\d{3})*/, '').trim();
         
         if (priceMatch && nameMatch) {
           const price = parseInt(priceMatch[1].replace(/,/g, ''));
@@ -1087,7 +1130,7 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
           await vendor.save();
           await sendMessage(adminPhone, fromJid, `✅ *${nameMatch}* added at ₦${price.toLocaleString()}. Send another or type *"done"*.`);
         } else {
-          await sendMessage(adminPhone, fromJid, `❌ Please include price in caption.\nExample: "Red Ankara ₦5500"`);
+          await sendMessage(adminPhone, fromJid, `❌ Please include price in caption.\nExample: "Red Ankara ₦5500" or "Red Ankara #5500"`);
         }
       } else {
         await sendMessage(adminPhone, fromJid, `Send a *photo* with name and price in caption, or type *"done"*.`);
@@ -1144,14 +1187,6 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
       }
       break;
 
-    // FIX #3: Handle completed onboarding (step 10) - vendor is already active
-    case 10:
-      await sendMessage(adminPhone, fromJid, 
-        `✅ You're all set up! Your store is active.\n\n` +
-        `Message your store number to manage products, or type *"help"* for commands.`
-      );
-      break;
-
     default:
       await sendMessage(adminPhone, fromJid, `Something went wrong. Please contact support.`);
       break;
@@ -1166,12 +1201,29 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
   
   const cartKey = `${vendor.phone}:${customerPhone}`;
   
-  // Only respond to buying intent, ignore casual greetings
   const buyingTriggers = ['menu', 'buy', 'product', 'order', 'price', 'how much', 'do you have', 'i want', 'i need', 'available', 'stock', '₦', 'naira'];
-  const isCasualGreeting = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'how are you', 'sup', 'wetin dey', 'how far'].some(g => lowerText.includes(g));
+  const casualGreetings = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'how are you', 'sup', 'wetin dey', 'how far'];
+  const isCasualGreeting = casualGreetings.some(g => lowerText.includes(g));
   const hasBuyingIntent = buyingTriggers.some(t => lowerText.includes(t));
   
-  // FIX #4: "help" should trigger help menu, not be treated as silent greeting
+  if (isCasualGreeting && !hasBuyingIntent && !activeCarts.has(cartKey)) {
+    console.log(`🔇 Silent: Casual greeting from ${customerPhone} to ${vendor.phone}: "${text.substring(0, 30)}"`);
+    return;
+  }
+  
+  if (lowerText === 'menu' || lowerText === 'start' || hasBuyingIntent) {
+    let menu = `👋 *Welcome to ${vendor.business_name}!*\n\n`;
+    menu += `${vendor.description}\n\n`;
+    menu += `*Our Products:*\n`;
+    vendor.products.forEach((p, i) => {
+      menu += `${i+1}. ${p.name} - ₦${p.price.toLocaleString()}\n`;
+    });
+    menu += `\nReply with a product *number* to order.\n`;
+    menu += `Or type *"help"* for assistance.`;
+    await sendMessage(sessionPhone, fromJid, menu);
+    return;
+  }
+
   if (lowerText === 'help') {
     let help = `*How to Order:*\n\n`;
     help += `1. Type *"menu"* to see products\n`;
@@ -1186,25 +1238,6 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
       });
     }
     await sendMessage(sessionPhone, fromJid, help);
-    return;
-  }
-  
-  // If casual greeting with no buying intent → silent
-  if (isCasualGreeting && !hasBuyingIntent && !activeCarts.has(cartKey)) {
-    console.log(`🔇 Silent: Casual greeting from ${customerPhone} to ${vendor.phone}: "${text.substring(0, 30)}"`);
-    return;
-  }
-  
-  if (lowerText === 'menu' || lowerText === 'start' || (isCasualGreeting && hasBuyingIntent)) {
-    let menu = `👋 *Welcome to ${vendor.business_name}!*\n\n`;
-    menu += `${vendor.description}\n\n`;
-    menu += `*Our Products:*\n`;
-    vendor.products.forEach((p, i) => {
-      menu += `${i+1}. ${p.name} - ₦${p.price.toLocaleString()}\n`;
-    });
-    menu += `\nReply with a product *number* to order.\n`;
-    menu += `Or type *"help"* for assistance.`;
-    await sendMessage(sessionPhone, fromJid, menu);
     return;
   }
 
@@ -1278,7 +1311,6 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
     return;
   }
 
-  // Unknown message with no buying intent
   if (!hasBuyingIntent && !activeCarts.has(cartKey)) {
     console.log(`🔇 Silent: No buying intent from ${customerPhone}: "${text.substring(0, 30)}"`);
     return;
