@@ -27,6 +27,7 @@ const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET || PAYSTACK_
 const WEBHOOK_BASE = process.env.WEBHOOK_BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
 const BASE_DIR = process.env.RENDER_DISK_PATH || '.';
 const IS_RENDER = !!process.env.RENDER_DISK_PATH;
+const IS_TEST_MODE = PAYSTACK_SECRET?.startsWith('sk_test_');
 
 if (!ADMIN_PHONE) {
   console.error('❌ ADMIN_PHONE not set in .env');
@@ -37,6 +38,8 @@ if (!PAYSTACK_SECRET) {
   console.error('❌ PAYSTACK_SECRET_KEY not set in .env');
   process.exit(1);
 }
+
+console.log(`🔑 Paystack mode: ${IS_TEST_MODE ? 'TEST (subaccounts disabled)' : 'LIVE (subaccounts enabled)'}`);
 
 // ─── ENSURE AUTH DIRECTORY EXISTS (Local/Termux only) ───────────────
 if (!IS_RENDER) {
@@ -72,6 +75,7 @@ const VendorSchema = new mongoose.Schema({
   bank_code: String,
   account_number: String,
   verified_name: String,
+  subaccount_code: String,
   description: String,
   faqs: [{ q: String, a: String }],
   products: [{ name: String, price: Number, image_url: String }],
@@ -127,6 +131,19 @@ function formatJid(phone) {
   return `${cleanPhone(phone)}@s.whatsapp.net`;
 }
 
+function formatDisplayNumber(phone) {
+  const clean = cleanPhone(phone);
+  if (clean.startsWith('234')) {
+    return `+234 ${clean.slice(3, 6)} ${clean.slice(6, 9)} ${clean.slice(9)}`;
+  }
+  return clean;
+}
+
+function stripDeviceId(jid) {
+  // Remove WhatsApp device ID suffix like :1, :2, :3 from JID before @s.whatsapp.net
+  return jid.split('@')[0].split(':')[0];
+}
+
 async function sendMessage(fromPhone, toJid, text) {
   const session = sessions.get(fromPhone);
   if (!session?.socket) {
@@ -144,6 +161,49 @@ async function sendMessage(fromPhone, toJid, text) {
 }
 
 // ─── PAYSTACK FUNCTIONS ─────────────────────────────────────────────
+async function createVendorSubaccount(vendor) {
+  if (IS_TEST_MODE) {
+    console.log(`🧪 Test mode: Skipping subaccount creation for ${vendor.phone}`);
+    return {
+      success: true,
+      subaccount_code: null,
+      account_name: vendor.business_name,
+      test_mode: true
+    };
+  }
+
+  try {
+    const res = await axios.post('https://api.paystack.co/subaccount', {
+      business_name: vendor.business_name,
+      settlement_bank: vendor.bank_code,
+      account_number: vendor.account_number,
+      percentage_charge: 10,
+      description: `Subaccount for ${vendor.business_name} - NaijaSales AI vendor`
+    }, {
+      headers: {
+        Authorization: `Bearer ${PAYSTACK_SECRET}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (res.data.status) {
+      return {
+        success: true,
+        subaccount_code: res.data.data.subaccount_code,
+        account_name: res.data.data.account_name,
+        settlement_bank: res.data.data.settlement_bank,
+        percentage_charge: res.data.data.percentage_charge
+      };
+    }
+    return { success: false, error: res.data.message };
+  } catch (err) {
+    return { 
+      success: false, 
+      error: err.response?.data?.message || err.message 
+    };
+  }
+}
+
 async function createVirtualAccount(order, customerName) {
   try {
     const customerRes = await axios.post('https://api.paystack.co/customer', {
@@ -152,48 +212,85 @@ async function createVirtualAccount(order, customerName) {
       last_name: customerName.split(' ').slice(1).join(' ') || '',
       phone: `+${order.customer_phone}`
     }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' }});
+    
     if (!customerRes.data.status) return { success: false, error: customerRes.data.message };
-    const vaRes = await axios.post('https://api.paystack.co/dedicated_account', {
-      customer: customerRes.data.data.customer_code, preferred_bank: 'wema-bank'
-    }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' }});
+
+    const vendor = await Vendor.findOne({ phone: order.vendor_phone });
+    const subaccount = vendor?.subaccount_code;
+
+    const payload = {
+      customer: customerRes.data.data.customer_code,
+      preferred_bank: 'wema-bank'
+    };
+    if (subaccount) payload.subaccount = subaccount;
+
+    const vaRes = await axios.post('https://api.paystack.co/dedicated_account', payload, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' }
+    });
+
     if (vaRes.data.status) {
       const account = vaRes.data.data;
-      return { success: true, account_name: account.account_name, account_number: account.account_number, bank_name: account.bank.name || account.bank_slug, account_id: account.id, customer_code: customerRes.data.data.customer_code };
+      return {
+        success: true,
+        account_name: account.account_name,
+        account_number: account.account_number,
+        bank_name: account.bank?.name || account.bank_slug,
+        account_id: account.id,
+        customer_code: customerRes.data.data.customer_code
+      };
     }
     return { success: false, error: vaRes.data.message };
-  } catch (err) { return { success: false, error: err.response?.data?.message || err.message }; }
+  } catch (err) {
+    return { success: false, error: err.response?.data?.message || err.message };
+  }
 }
 
 async function verifyTransaction(reference) {
-  try { return (await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }})).data; }
-  catch (err) { return { status: false, message: err.message }; }
+  try { 
+    return (await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, { 
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
+    })).data; 
+  }
+  catch (err) { 
+    return { status: false, message: err.message }; 
+  }
 }
 
 async function transferToVendor(vendor, amountKobo, reference, reason) {
   try {
     const recipientRes = await axios.post('https://api.paystack.co/transferrecipient', {
-      type: 'nuban', name: vendor.verified_name || vendor.business_name,
-      account_number: vendor.account_number, bank_code: vendor.bank_code || '058', currency: 'NGN'
+      type: 'nuban', 
+      name: vendor.verified_name || vendor.business_name,
+      account_number: vendor.account_number, 
+      bank_code: vendor.bank_code || '058', 
+      currency: 'NGN'
     }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' }});
+    
     if (!recipientRes.data.status) return { success: false, error: recipientRes.data.message };
+    
     const transferRes = await axios.post('https://api.paystack.co/transfer', {
-      source: 'balance', amount: amountKobo, reference, recipient: recipientRes.data.data.recipient_code, reason
+      source: 'balance', 
+      amount: amountKobo, 
+      reference, 
+      recipient: recipientRes.data.data.recipient_code, 
+      reason
     }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, 'Content-Type': 'application/json' }});
+    
     return transferRes.data;
-  } catch (err) { return { status: false, message: err.message }; }
+  } catch (err) { 
+    return { status: false, message: err.message }; 
+  }
 }
 
-// ─── SESSION CREATION (WITH MONGODB AUTH PERSISTENCE) ────────────────
+// ─── SESSION CREATION ────────────────────────────────────────────────
 async function createSession(phone, isAdmin = false, requesterJid = null) {
   const clean = cleanPhone(phone);
 
-  // ── Check DB readiness for MongoDB auth ──
   if (IS_RENDER && !dbReady) {
     console.log(`⏸️ Cannot create session for ${clean}: DB not ready`);
     return { success: false, error: 'Database not connected' };
   }
 
-  // ── Properly clean up existing session ──
   if (sessions.has(clean)) {
     const existing = sessions.get(clean);
     console.log(`🧹 Cleaning up existing session for ${clean}`);
@@ -213,17 +310,24 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
 
     let state, saveCreds;
     
-    if (IS_RENDER) {
+    if (IS_RENDER && dbReady) {
       console.log(`☁️ Using MongoDB auth state for ${clean}`);
-      const mongoAuth = await useMongoDBAuthState(clean);
-      state = mongoAuth.state;
-      saveCreds = mongoAuth.saveCreds;
+      try {
+        const mongoAuth = await useMongoDBAuthState(clean);
+        state = mongoAuth.state;
+        saveCreds = mongoAuth.saveCreds;
+      } catch (mongoErr) {
+        console.log(`⚠️ MongoDB auth failed, falling back to file auth: ${mongoErr.message}`);
+        const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
+        if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+        const fileAuth = await useMultiFileAuthState(sessionDir);
+        state = fileAuth.state;
+        saveCreds = fileAuth.saveCreds;
+      }
     } else {
       console.log(`💾 Using file auth state for ${clean}`);
       const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
-      if (!fs.existsSync(sessionDir)) {
-        fs.mkdirSync(sessionDir, { recursive: true });
-      }
+      if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
       const fileAuth = await useMultiFileAuthState(sessionDir);
       state = fileAuth.state;
       saveCreds = fileAuth.saveCreds;
@@ -258,14 +362,11 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
     sock.ev.on('creds.update', saveCreds);
 
     const connectionPromise = new Promise((resolve) => {
-      
-      // ── FIX: Store timeout ID so we can clear it ──
       let qrTimeoutId = null;
       
       sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // ── FIX: Ignore undefined states ──
         if (connection === undefined && !qr) {
           console.log(`[${clean}] Connection state undefined, waiting...`);
           return;
@@ -273,7 +374,6 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
         
         console.log(`[${clean}] Connection update:`, { connection, hasQR: !!qr });
         
-        // ── GENERATE AND SEND QR CODE ──
         if (qr && !sessionData.qrSent) {
           sessionData.qrSent = true;
           
@@ -291,7 +391,6 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
             }
             console.log(`\n📱 [${clean}] QR Code generated!`);
             
-            // ── Send QR via ADMIN session ──
             if (requesterJid) {
               const adminSession = sessions.get(cleanPhone(ADMIN_PHONE));
               
@@ -321,9 +420,7 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
           }
         }
         
-        // ── CONNECTION OPENED ──
         if (connection === 'open' && !sessionData.resolved) {
-          // ── FIX: Clear timeout so it doesn't fire after connection ──
           if (qrTimeoutId) {
             clearTimeout(qrTimeoutId);
             qrTimeoutId = null;
@@ -333,33 +430,74 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
           sessionData.resolved = true;
           sessionData.reconnectAttempts = 0;
           console.log(`✅ [${clean}] CONNECTED`);
+          
           if (!isAdmin) {
             await Vendor.updateOne({ phone: clean }, { $set: { auth_connected: true } });
           }
+
+          // Send congratulations to vendor via admin session
+          if (!isAdmin && requesterJid) {
+            const vendor = await Vendor.findOne({ phone: clean });
+            if (vendor) {
+              const displayPhone = formatDisplayNumber(vendor.phone);
+              const adminSession = sessions.get(cleanPhone(ADMIN_PHONE));
+              if (adminSession?.socket) {
+                await adminSession.socket.sendMessage(requesterJid, {
+                  text: `🎉 *Congratulations ${vendor.business_name}!*\n\n` +
+                    `Your WhatsApp store is now *LIVE*! 🚀\n\n` +
+                    `*What happens now:*\n` +
+                    `• Customers can message you on WhatsApp\n` +
+                    `• The AI will handle sales 24/7\n` +
+                    `• You'll get notified of every order\n\n` +
+                    `*To manage your store, save and message this number:*\n` +
+                    `${displayPhone}\n\n` +
+                    `Type *"help"* for commands.\n\n` +
+                    `${IS_TEST_MODE ? '⚠️ Test mode: Payments are simulated. Switch to live keys for real transactions.' : ''}`
+                });
+              }
+            }
+          }
+          
           resolve({ success: true });
         }
         
-        // ── CONNECTION CLOSED ──
         if (connection === 'close') {
           sessionData.connected = false;
           const statusCode = lastDisconnect?.error?.output?.statusCode;
-          const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
           
+          if (statusCode === 515) {
+            console.log(`🔄 [${clean}] Stream error (515), restarting silently...`);
+            if (qrTimeoutId) { clearTimeout(qrTimeoutId); qrTimeoutId = null; }
+            sessions.delete(clean);
+            setTimeout(() => createSession(clean, isAdmin, requesterJid), 2000);
+            return;
+          }
+          
+          if (statusCode === 440) {
+            console.log(`⏳ [${clean}] Rate limited (440), waiting 60s...`);
+            if (qrTimeoutId) { clearTimeout(qrTimeoutId); qrTimeoutId = null; }
+            setTimeout(() => {
+              if (!sessions.get(clean)?.connected) {
+                createSession(clean, isAdmin, requesterJid);
+              }
+            }, 60000);
+            return;
+          }
+          
+          const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
           console.log(`❌ [${clean}] Disconnected (code: ${statusCode}). Reconnect: ${shouldReconnect}`);
 
-          // ── FIX: Clear timeout on disconnect too ──
           if (qrTimeoutId) {
             clearTimeout(qrTimeoutId);
             qrTimeoutId = null;
           }
 
-          // ── FIX: Handle 401 Unauthorized ──
           if (statusCode === 401) {
             console.log(`🚫 [${clean}] Session unauthorized. Clearing auth...`);
             sessionData.resolved = true;
             sessions.delete(clean);
             
-            if (IS_RENDER) {
+            if (IS_RENDER && dbReady) {
               await mongoose.model('AuthState').deleteOne({ phone: clean });
             } else {
               const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
@@ -397,6 +535,7 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
             } else {
               console.log(`❌ [${clean}] Max reconnection attempts reached`);
               sessionData.resolved = true;
+              
               if (!isAdmin) {
                 await Vendor.updateOne(
                   { phone: clean },
@@ -414,7 +553,7 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
             sessionData.resolved = true;
             sessions.delete(clean);
             
-            if (IS_RENDER) {
+            if (IS_RENDER && dbReady) {
               await mongoose.model('AuthState').deleteOne({ phone: clean });
             } else {
               const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
@@ -433,7 +572,6 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
         }
       });
       
-      // ── FIX: Store timeout ID ──
       qrTimeoutId = setTimeout(() => {
         if (!sessionData.resolved && !sessionData.connected) {
           console.log(`⏰ [${clean}] QR timeout reached`);
@@ -446,7 +584,11 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
     sock.ev.on('messages.upsert', async (m) => {
       if (m.type !== 'notify') return;
       for (const msg of m.messages) {
-        if (msg.key.fromMe) continue;
+        // Allow self-messages for vendor management
+        // Only skip if it's truly fromMe AND not a self-chat
+        const isSelfChat = msg.key.remoteJid === `${clean}@s.whatsapp.net`;
+        if (msg.key.fromMe && !isSelfChat) continue;
+        
         await handleIncomingMessage(clean, msg, isAdmin);
       }
     });
@@ -468,19 +610,23 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
 async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
   const fromJid = msg.key.remoteJid;
   const isGroup = fromJid.endsWith('@g.us');
-  const senderJid = msg.key.participant || fromJid;
-  const senderClean = cleanPhone(senderJid.split('@')[0]);
+  
+  // FIX #1: Strip device ID suffix (:1, :2, etc.) from participant JID
+  // This was causing senderClean to not match sessionPhone for self-messages
+  const senderJid = msg.key.participant || msg.key.remoteJid;
+  const senderClean = cleanPhone(stripDeviceId(senderJid));
+  
   const text = getMessageText(msg);
   const lowerText = text.toLowerCase().trim();
 
-  console.log(`📩 [${sessionPhone}] ${isAdminSession ? 'ADMIN' : 'VENDOR'} | From: ${senderClean} | Group: ${isGroup} | "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+  console.log(`📩 [${sessionPhone}] ${isAdminSession ? 'ADMIN' : 'VENDOR'} | From: ${senderClean} | Self: ${senderClean === sessionPhone} | Group: ${isGroup} | "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
 
   if (!dbReady) {
     console.log('⚠️ DB not ready');
     return;
   }
 
-  // ── Ignore group chats for onboarding/admin ──
+  // ── Group messages ──
   if (isGroup && !isAdminSession) {
     const vendor = await Vendor.findOne({ phone: sessionPhone });
     if (!vendor || vendor.status !== 'active') {
@@ -495,22 +641,30 @@ async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
     return;
   }
 
+  // ── Admin DMs ──
   if (isAdminSession) {
     await handleAdminMessage(senderClean, fromJid, text, lowerText, sessionPhone, msg);
     return;
   }
 
+  // ── Vendor session DMs ──
   const vendor = await Vendor.findOne({ phone: sessionPhone });
   if (!vendor) {
     console.log(`⚠️ No vendor found for session ${sessionPhone}`);
     return;
   }
 
+  // Vendor messaging themselves → self-management
   if (senderClean === sessionPhone) {
-    await handleVendorSelfManagement(vendor, fromJid, text, lowerText, sessionPhone, msg);
+    console.log(`🔧 Vendor self-management: ${senderClean}`);
+    const handled = await handleVendorCommands(vendor, fromJid, text, lowerText, sessionPhone, msg);
+    if (!handled) {
+      await sendMessage(sessionPhone, fromJid, `Type *"help"* for available commands.`);
+    }
     return;
   }
 
+  // Customer messaging vendor → customer handler
   if (vendor.status === 'active') {
     await handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPhone, senderClean);
     return;
@@ -524,18 +678,16 @@ async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
 // ─── ADMIN HANDLER ──────────────────────────────────────────────────
 async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone, msg) {
   
-  // ── Skip empty messages ──
   if (!text || text.trim().length === 0) {
     return;
   }
   
-  // ── Skip newsletters, broadcasts, groups ──
   if (fromJid.includes('@newsletter') || fromJid.includes('@broadcast') || fromJid.endsWith('@g.us')) {
     console.log(`⏸️ Ignoring non-DM from ${sender}`);
     return;
   }
   
-  // ── COMMANDS (always respond) ──
+  // ── Admin commands ──
   if (lowerText === '/vendors' || lowerText === 'vendors') {
     const vendors = await Vendor.find().sort({ created_at: -1 }).limit(20);
     let reply = `📋 *All Vendors (${vendors.length})*\n\n`;
@@ -560,31 +712,37 @@ async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone, 
     return;
   }
 
-  // ── CHECK IF EXISTING VENDOR ──
+  // ── Check if this sender is an existing vendor ──
   let vendor = await Vendor.findOne({ phone: sender });
 
   if (vendor) {
-    // Existing vendor — handle normally
+    // Vendor exists — if onboarding, continue flow
     if (vendor.status === 'onboarding') {
       await handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, msg);
       return;
     }
     
-    // Active vendor — minimal response
+    // FIX #2: Active vendor messaging admin → handle store commands here too
+    // AND route "help" properly instead of sending generic reminder
+    const handled = await handleVendorCommands(vendor, fromJid, text, lowerText, adminPhone, msg);
+    if (handled) return;
+    
+    // If not a recognized command, remind them they can use their own number
+    const displayPhone = formatDisplayNumber(vendor.phone);
     await sendMessage(adminPhone, fromJid, 
       `👋 *${vendor.business_name}*, your store is active!\n\n` +
-      `To manage your store, message your own WhatsApp number: *${vendor.phone}*\n\n` +
-      `Or type *"help"* for commands.`
+      `You can manage your store right here or message your store number:\n` +
+      `${displayPhone}\n\n` +
+      `Type *"help"* for commands.`
     );
     return;
   }
 
-  // ── NEW USER — ONLY RESPOND TO TRIGGER WORDS ──
+  // ── New user — only respond to trigger words ──
   const triggerWords = ['register', 'start', 'sell', 'onboard', 'setup', 'join'];
   const hasTrigger = triggerWords.some(word => lowerText.includes(word));
   
   if (hasTrigger) {
-    // Create new vendor and start onboarding
     vendor = new Vendor({ phone: sender, onboarding_step: 0 });
     await vendor.save();
     await sendMessage(adminPhone, fromJid, 
@@ -597,9 +755,204 @@ async function handleAdminMessage(sender, fromJid, text, lowerText, adminPhone, 
     return;
   }
   
-  // ── SILENT FOR EVERYTHING ELSE ──
+  // Silent for everything else
   console.log(`🔇 Silent: Ignoring message from ${sender}: "${text.substring(0, 30)}"`);
-  // DO NOT SEND ANY MESSAGE
+}
+
+// ─── VENDOR COMMANDS (shared) ───────────────────────────────────────
+async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPhone, msg) {
+  console.log(`🔧 Vendor command from ${vendor.phone}: "${text.substring(0, 30)}"`);
+
+  if (lowerText === 'help') {
+    const displayPhone = formatDisplayNumber(vendor.phone);
+    await sendMessage(sessionPhone, fromJid, 
+      `*Store Management Commands:*\n\n` +
+      `• *products* - View your products\n` +
+      `• *add product* - Add a new product\n` +
+      `• *remove [name]* - Remove a product\n` +
+      `• *pause* - Pause your store\n` +
+      `• *resume* - Resume your store\n` +
+      `• *stats* - View sales stats\n` +
+      `• *sales today* - Today's sales\n` +
+      `• *sales week* - This week's sales\n` +
+      `• *sales month* - This month's sales\n` +
+      `• *balance* - Check payouts\n` +
+      `• *payout* - Withdraw balance\n` +
+      `• *disconnect* - Disconnect WhatsApp\n\n` +
+      `Your store number: ${displayPhone}`
+    );
+    return true;
+  }
+
+  if (lowerText === 'products') {
+    if (vendor.products.length === 0) {
+      await sendMessage(sessionPhone, fromJid, `You have no products yet. Send *"add product"* to add one.`);
+      return true;
+    }
+    let reply = `*Your Products:*\n\n`;
+    vendor.products.forEach((p, i) => {
+      reply += `${i+1}. ${p.name} - ₦${p.price.toLocaleString()}\n`;
+    });
+    await sendMessage(sessionPhone, fromJid, reply);
+    return true;
+  }
+
+  if (lowerText === 'add product') {
+    await sendMessage(sessionPhone, fromJid, `Send a product photo with the name and price in the caption.\nExample: "Red Ankara ₦5500"`);
+    return true;
+  }
+
+  if (lowerText.startsWith('remove ')) {
+    const productName = text.substring(7).trim();
+    const idx = vendor.products.findIndex(p => p.name.toLowerCase() === productName.toLowerCase());
+    if (idx >= 0) {
+      vendor.products.splice(idx, 1);
+      await vendor.save();
+      await sendMessage(sessionPhone, fromJid, `✅ *${productName}* removed.`);
+    } else {
+      await sendMessage(sessionPhone, fromJid, `❌ Product "${productName}" not found.`);
+    }
+    return true;
+  }
+
+  if (lowerText === 'pause') {
+    vendor.status = 'paused';
+    await vendor.save();
+    await sendMessage(sessionPhone, fromJid, `⏸️ Store paused. Customers will see a pause message.`);
+    return true;
+  }
+
+  if (lowerText === 'resume') {
+    vendor.status = 'active';
+    await vendor.save();
+    await sendMessage(sessionPhone, fromJid, `▶️ Store resumed! Customers can now order.`);
+    return true;
+  }
+
+  if (lowerText === 'stats') {
+    const totalOrders = await Order.countDocuments({ vendor_phone: vendor.phone });
+    const paidOrders = await Order.countDocuments({ vendor_phone: vendor.phone, status: 'paid' });
+    const totalRevenue = await Order.aggregate([
+      { $match: { vendor_phone: vendor.phone, status: 'paid' } },
+      { $group: { _id: null, total: { $sum: '$total' } } }
+    ]);
+    const revenue = totalRevenue[0]?.total || 0;
+    
+    await sendMessage(sessionPhone, fromJid, 
+      `*Sales Stats:*\n\n` +
+      `Total Orders: ${totalOrders}\n` +
+      `Paid Orders: ${paidOrders}\n` +
+      `Total Revenue: ₦${revenue.toLocaleString()}`
+    );
+    return true;
+  }
+
+  if (lowerText === 'sales today') {
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    const orders = await Order.find({ 
+      vendor_phone: vendor.phone, 
+      status: 'paid',
+      paid_at: { $gte: start }
+    });
+    const total = orders.reduce((sum, o) => sum + o.total, 0);
+    await sendMessage(sessionPhone, fromJid, 
+      `*Today's Sales*\n\n` +
+      `Orders: ${orders.length}\n` +
+      `Revenue: ₦${total.toLocaleString()}`
+    );
+    return true;
+  }
+
+  if (lowerText === 'sales week') {
+    const start = new Date();
+    start.setDate(start.getDate() - start.getDay());
+    start.setHours(0, 0, 0, 0);
+    const orders = await Order.find({ 
+      vendor_phone: vendor.phone, 
+      status: 'paid',
+      paid_at: { $gte: start }
+    });
+    const total = orders.reduce((sum, o) => sum + o.total, 0);
+    await sendMessage(sessionPhone, fromJid, 
+      `*This Week's Sales*\n\n` +
+      `Orders: ${orders.length}\n` +
+      `Revenue: ₦${total.toLocaleString()}`
+    );
+    return true;
+  }
+
+  if (lowerText === 'sales month') {
+    const start = new Date();
+    start.setDate(1);
+    start.setHours(0, 0, 0, 0);
+    const orders = await Order.find({ 
+      vendor_phone: vendor.phone, 
+      status: 'paid',
+      paid_at: { $gte: start }
+    });
+    const total = orders.reduce((sum, o) => sum + o.total, 0);
+    await sendMessage(sessionPhone, fromJid, 
+      `*This Month's Sales*\n\n` +
+      `Orders: ${orders.length}\n` +
+      `Revenue: ₦${total.toLocaleString()}`
+    );
+    return true;
+  }
+
+  if (lowerText === 'balance') {
+    await sendMessage(sessionPhone, fromJid, 
+      `💰 *Balance Info*\n\n` +
+      `Your earnings are automatically split and settled to your bank account (T+1).\n\n` +
+      `Type *"stats"* for order totals, or *"sales today/week/month"* for breakdowns.`
+    );
+    return true;
+  }
+
+  if (lowerText === 'payout') {
+    await sendMessage(sessionPhone, fromJid, 
+      `💰 *Payout*\n\n` +
+      `With Paystack subaccounts, your earnings are automatically settled to your bank account.\n\n` +
+      `No manual payout needed! Money arrives in your bank within 24 hours of each payment.`
+    );
+    return true;
+  }
+
+  if (lowerText === 'disconnect') {
+    const session = sessions.get(sessionPhone);
+    if (session?.socket) {
+      try { session.socket.end(); } catch(e) {}
+    }
+    sessions.delete(sessionPhone);
+    vendor.auth_connected = false;
+    vendor.status = 'onboarding';
+    vendor.onboarding_step = 9;
+    await vendor.save();
+    await sendMessage(sessionPhone, fromJid, `❌ Disconnected. Reply *"reconnect"* on the admin number to link again.`);
+    return true;
+  }
+
+  if (msg.message?.imageMessage) {
+    const caption = msg.message.imageMessage.caption || '';
+    const priceMatch = caption.match(/[₦N]\s*(\d+(?:,\d{3})*)/);
+    const nameMatch = caption.replace(/[₦N]\s*\d+(?:,\d{3})*/, '').trim();
+    
+    if (priceMatch && nameMatch) {
+      const price = parseInt(priceMatch[1].replace(/,/g, ''));
+      vendor.products.push({
+        name: nameMatch,
+        price: price,
+        image_url: msg.message.imageMessage.url || ''
+      });
+      await vendor.save();
+      await sendMessage(sessionPhone, fromJid, `✅ *${nameMatch}* added at ₦${price.toLocaleString()}.`);
+    } else {
+      await sendMessage(sessionPhone, fromJid, `❌ Please include price in caption.\nExample: "Red Ankara ₦5500"`);
+    }
+    return true;
+  }
+
+  // Not a recognized command
+  return false;
 }
 
 // ─── ONBOARDING FLOW ────────────────────────────────────────────────
@@ -650,19 +1003,30 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
         return;
       }
       vendor.account_number = accNum;
-      vendor.onboarding_step = 4;
+      
+      await sendMessage(adminPhone, fromJid, `⏳ Creating your payment account...`);
+      const subaccountResult = await createVendorSubaccount(vendor);
+      
+      if (!subaccountResult.success) {
+        await sendMessage(adminPhone, fromJid, 
+          `❌ Failed to create payment account: ${subaccountResult.error}\n\n` +
+          `Please check your bank details and try again, or contact support.`
+        );
+        return;
+      }
+      
+      vendor.subaccount_code = subaccountResult.subaccount_code;
+      vendor.verified_name = subaccountResult.account_name || vendor.business_name;
+      vendor.onboarding_step = 5;
       await vendor.save();
       
-      setTimeout(async () => {
-        vendor.verified_name = vendor.business_name;
-        vendor.onboarding_step = 5;
-        await vendor.save();
-        await sendMessage(adminPhone, fromJid, 
-          `✅ Account verified!\n\n` +
-          `Now send me a *short description* of what you sell.\n\n` +
-          `Example: "I sell quality ankara and aso-oke fabrics for weddings and events."`
-        );
-      }, 1500);
+      const testNote = IS_TEST_MODE ? '\n\n⚠️ *Test mode active:* Subaccounts are simulated. Switch to live Paystack keys for real auto-payouts.' : '';
+      
+      await sendMessage(adminPhone, fromJid, 
+        `✅ Account verified and payment account created!${testNote}\n\n` +
+        `Now send me a *short description* of what you sell.\n\n` +
+        `Example: "I sell quality ankara and aso-oke fabrics for weddings and events."`
+      );
       break;
 
     case 5:
@@ -738,7 +1102,6 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
         
         const result = await createSession(vendor.phone, false, fromJid);
         if (result.success) {
-          await sendMessage(adminPhone, fromJid, `✅ WhatsApp connected! Your store is now active.`);
           vendor.status = 'active';
           vendor.onboarding_step = 10;
           await vendor.save();
@@ -752,10 +1115,9 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
 
     case 9:
       if (lowerText === 'reconnect') {
-        // ── FIX: Clear old auth before reconnecting ──
         console.log(`🧹 Clearing old auth for ${vendor.phone} before reconnect...`);
         
-        if (IS_RENDER) {
+        if (IS_RENDER && dbReady) {
           await mongoose.model('AuthState').deleteOne({ phone: cleanPhone(vendor.phone) });
         } else {
           const sessionDir = `${BASE_DIR}/auth_info/${cleanPhone(vendor.phone)}`;
@@ -782,127 +1144,18 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
       }
       break;
 
+    // FIX #3: Handle completed onboarding (step 10) - vendor is already active
+    case 10:
+      await sendMessage(adminPhone, fromJid, 
+        `✅ You're all set up! Your store is active.\n\n` +
+        `Message your store number to manage products, or type *"help"* for commands.`
+      );
+      break;
+
     default:
       await sendMessage(adminPhone, fromJid, `Something went wrong. Please contact support.`);
       break;
   }
-}
-
-// ─── VENDOR SELF-MANAGEMENT ─────────────────────────────────────────
-async function handleVendorSelfManagement(vendor, fromJid, text, lowerText, sessionPhone, msg) {
-  if (lowerText === 'help') {
-    await sendMessage(sessionPhone, fromJid, 
-      `*Store Management Commands:*\n\n` +
-      `• *products* - View your products\n` +
-      `• *add product* - Add a new product\n` +
-      `• *remove [name]* - Remove a product\n` +
-      `• *pause* - Pause your store\n` +
-      `• *resume* - Resume your store\n` +
-      `• *stats* - View sales stats\n` +
-      `• *balance* - Check payouts\n` +
-      `• *disconnect* - Disconnect WhatsApp`
-    );
-    return;
-  }
-
-  if (lowerText === 'products') {
-    if (vendor.products.length === 0) {
-      await sendMessage(sessionPhone, fromJid, `You have no products yet. Send *"add product"* to add one.`);
-      return;
-    }
-    let reply = `*Your Products:*\n\n`;
-    vendor.products.forEach((p, i) => {
-      reply += `${i+1}. ${p.name} - ₦${p.price.toLocaleString()}\n`;
-    });
-    await sendMessage(sessionPhone, fromJid, reply);
-    return;
-  }
-
-  if (lowerText === 'add product') {
-    await sendMessage(sessionPhone, fromJid, `Send a product photo with the name and price in the caption.\nExample: "Red Ankara ₦5500"`);
-    return;
-  }
-
-  if (lowerText.startsWith('remove ')) {
-    const productName = text.substring(7).trim();
-    const idx = vendor.products.findIndex(p => p.name.toLowerCase() === productName.toLowerCase());
-    if (idx >= 0) {
-      vendor.products.splice(idx, 1);
-      await vendor.save();
-      await sendMessage(sessionPhone, fromJid, `✅ *${productName}* removed.`);
-    } else {
-      await sendMessage(sessionPhone, fromJid, `❌ Product "${productName}" not found.`);
-    }
-    return;
-  }
-
-  if (lowerText === 'pause') {
-    vendor.status = 'paused';
-    await vendor.save();
-    await sendMessage(sessionPhone, fromJid, `⏸️ Store paused. Customers will see a pause message.`);
-    return;
-  }
-
-  if (lowerText === 'resume') {
-    vendor.status = 'active';
-    await vendor.save();
-    await sendMessage(sessionPhone, fromJid, `▶️ Store resumed! Customers can now order.`);
-    return;
-  }
-
-  if (lowerText === 'stats') {
-    const totalOrders = await Order.countDocuments({ vendor_phone: vendor.phone });
-    const paidOrders = await Order.countDocuments({ vendor_phone: vendor.phone, status: 'paid' });
-    const totalRevenue = await Order.aggregate([
-      { $match: { vendor_phone: vendor.phone, status: 'paid' } },
-      { $group: { _id: null, total: { $sum: '$total' } } }
-    ]);
-    const revenue = totalRevenue[0]?.total || 0;
-    
-    await sendMessage(sessionPhone, fromJid, 
-      `*Sales Stats:*\n\n` +
-      `Total Orders: ${totalOrders}\n` +
-      `Paid Orders: ${paidOrders}\n` +
-      `Total Revenue: ₦${revenue.toLocaleString()}`
-    );
-    return;
-  }
-
-  if (lowerText === 'disconnect') {
-    const session = sessions.get(sessionPhone);
-    if (session?.socket) {
-      try { session.socket.end(); } catch(e) {}
-    }
-    sessions.delete(sessionPhone);
-    vendor.auth_connected = false;
-    vendor.status = 'onboarding';
-    vendor.onboarding_step = 9;
-    await vendor.save();
-    await sendMessage(sessionPhone, fromJid, `❌ Disconnected. Reply *"reconnect"* on the admin number to link again.`);
-    return;
-  }
-
-  if (msg.message?.imageMessage && vendor.onboarding_step >= 10) {
-    const caption = msg.message.imageMessage.caption || '';
-    const priceMatch = caption.match(/[₦N]\s*(\d+(?:,\d{3})*)/);
-    const nameMatch = caption.replace(/[₦N]\s*\d+(?:,\d{3})*/, '').trim();
-    
-    if (priceMatch && nameMatch) {
-      const price = parseInt(priceMatch[1].replace(/,/g, ''));
-      vendor.products.push({
-        name: nameMatch,
-        price: price,
-        image_url: msg.message.imageMessage.url || ''
-      });
-      await vendor.save();
-      await sendMessage(sessionPhone, fromJid, `✅ *${nameMatch}* added at ₦${price.toLocaleString()}.`);
-    } else {
-      await sendMessage(sessionPhone, fromJid, `❌ Please include price in caption.\nExample: "Red Ankara ₦5500"`);
-    }
-    return;
-  }
-
-  await sendMessage(sessionPhone, fromJid, `Type *"help"* for available commands.`);
 }
 
 // ─── CUSTOMER MESSAGE HANDLER ───────────────────────────────────────
@@ -913,19 +1166,12 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
   
   const cartKey = `${vendor.phone}:${customerPhone}`;
   
-  if (lowerText === 'hi' || lowerText === 'hello' || lowerText === 'start' || lowerText === 'menu') {
-    let menu = `👋 *Welcome to ${vendor.business_name}!*\n\n`;
-    menu += `${vendor.description}\n\n`;
-    menu += `*Our Products:*\n`;
-    vendor.products.forEach((p, i) => {
-      menu += `${i+1}. ${p.name} - ₦${p.price.toLocaleString()}\n`;
-    });
-    menu += `\nReply with a product *number* to order.\n`;
-    menu += `Or type *"help"* for assistance.`;
-    await sendMessage(sessionPhone, fromJid, menu);
-    return;
-  }
-
+  // Only respond to buying intent, ignore casual greetings
+  const buyingTriggers = ['menu', 'buy', 'product', 'order', 'price', 'how much', 'do you have', 'i want', 'i need', 'available', 'stock', '₦', 'naira'];
+  const isCasualGreeting = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'how are you', 'sup', 'wetin dey', 'how far'].some(g => lowerText.includes(g));
+  const hasBuyingIntent = buyingTriggers.some(t => lowerText.includes(t));
+  
+  // FIX #4: "help" should trigger help menu, not be treated as silent greeting
   if (lowerText === 'help') {
     let help = `*How to Order:*\n\n`;
     help += `1. Type *"menu"* to see products\n`;
@@ -940,6 +1186,25 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
       });
     }
     await sendMessage(sessionPhone, fromJid, help);
+    return;
+  }
+  
+  // If casual greeting with no buying intent → silent
+  if (isCasualGreeting && !hasBuyingIntent && !activeCarts.has(cartKey)) {
+    console.log(`🔇 Silent: Casual greeting from ${customerPhone} to ${vendor.phone}: "${text.substring(0, 30)}"`);
+    return;
+  }
+  
+  if (lowerText === 'menu' || lowerText === 'start' || (isCasualGreeting && hasBuyingIntent)) {
+    let menu = `👋 *Welcome to ${vendor.business_name}!*\n\n`;
+    menu += `${vendor.description}\n\n`;
+    menu += `*Our Products:*\n`;
+    vendor.products.forEach((p, i) => {
+      menu += `${i+1}. ${p.name} - ₦${p.price.toLocaleString()}\n`;
+    });
+    menu += `\nReply with a product *number* to order.\n`;
+    menu += `Or type *"help"* for assistance.`;
+    await sendMessage(sessionPhone, fromJid, menu);
     return;
   }
 
@@ -992,6 +1257,14 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
         `Name: ${va.account_name}\n\n` +
         `⏰ Valid for 24 hours. Pay to complete your order!`
       );
+      
+      await sendMessage(vendor.phone, formatJid(vendor.phone), 
+        `📦 *New Order!*\n\n` +
+        `Customer: ${customerPhone}\n` +
+        `Item: ${cart.product.name}\n` +
+        `Amount: ₦${order.total.toLocaleString()}\n\n` +
+        `Waiting for payment...`
+      );
     } else {
       await sendMessage(sessionPhone, fromJid, `❌ Failed to create payment account. Please try again.`);
     }
@@ -1002,6 +1275,12 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
   if (lowerText === 'cancel') {
     activeCarts.delete(cartKey);
     await sendMessage(sessionPhone, fromJid, `❌ Cancelled. Type *"menu"* to browse.`);
+    return;
+  }
+
+  // Unknown message with no buying intent
+  if (!hasBuyingIntent && !activeCarts.has(cartKey)) {
+    console.log(`🔇 Silent: No buying intent from ${customerPhone}: "${text.substring(0, 30)}"`);
     return;
   }
 
@@ -1033,24 +1312,16 @@ app.post('/webhook/paystack', async (req, res) => {
 
       const vendor = await Vendor.findOne({ phone: order.vendor_phone });
       if (vendor) {
-        const commissionRate = 0.05;
-        const amountKobo = Math.floor(order.total * (1 - commissionRate) * 100);
-        const transferRef = `tf_${Date.now()}_${order._id}`;
+        const payoutMsg = IS_TEST_MODE 
+          ? '✅ Payment confirmed (test mode — no real money moved).'
+          : 'Your share (90%) has been credited to your subaccount and will settle to your bank shortly.';
         
-        const transfer = await transferToVendor(vendor, amountKobo, transferRef, `Order payment - ${order.customer_phone}`);
-        
-        if (transfer.status) {
-          order.paystack_transfer_ref = transferRef;
-          await order.save();
-          
-          await sendMessage(vendor.phone, formatJid(vendor.phone), 
-            `🎉 *New Order Paid!*\n\n` +
-            `Customer: ${order.customer_phone}\n` +
-            `Amount: ₦${order.total.toLocaleString()}\n` +
-            `Payout: ₦${(amountKobo / 100).toLocaleString()}\n` +
-            `Transfer Ref: ${transferRef}`
-          );
-        }
+        await sendMessage(vendor.phone, formatJid(vendor.phone), 
+          `🎉 *Order Paid!*\n\n` +
+          `Customer: ${order.customer_phone}\n` +
+          `Amount: ₦${order.total.toLocaleString()}\n` +
+          `${payoutMsg}`
+        );
       }
 
       await sendMessage(order.vendor_phone, formatJid(order.customer_phone), 
@@ -1078,7 +1349,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ─── KEEP-ALIVE PING (Prevents Render from sleeping) ─────────────────
+// ─── KEEP-ALIVE PING ────────────────────────────────────────────────
 setInterval(() => {
   if (WEBHOOK_BASE && WEBHOOK_BASE !== `http://localhost:${process.env.PORT || 3000}`) {
     axios.get(`${WEBHOOK_BASE}/health`)
@@ -1087,7 +1358,7 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// ─── CONNECTION MONITOR (Heartbeat to keep WA alive) ─────────────────
+// ─── CONNECTION MONITOR ─────────────────────────────────────────────
 setInterval(async () => {
   for (const [phone, session] of sessions.entries()) {
     if (!session.connected || !session.socket?.ws) {
@@ -1120,7 +1391,6 @@ setInterval(async () => {
   const adminClean = cleanPhone(ADMIN_PHONE);
   const adminSession = sessions.get(adminClean);
   
-  // Only reconnect if no session exists or explicitly disconnected
   if (!adminSession) {
     console.log('👀 Admin session watchdog: no session, reconnecting...');
     await createSession(ADMIN_PHONE, true);
@@ -1129,7 +1399,6 @@ setInterval(async () => {
     console.log('👀 Admin session watchdog: was disconnected, reconnecting...');
     await createSession(ADMIN_PHONE, true);
   }
-  // If connected or syncing (undefined), do nothing
 }, 30000);
 
 // ─── AUTO-RECONNECT ALL SESSIONS ON STARTUP ─────────────────────────
