@@ -9,6 +9,7 @@ const {
 } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
 const axios = require('axios');
 const { useMongoDBAuthState } = require('./authStore');
@@ -56,12 +57,10 @@ if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !pr
 console.log(`🔑 Paystack mode: ${IS_TEST_MODE ? 'TEST (subaccounts disabled)' : 'LIVE (subaccounts enabled)'}`);
 console.log(`☁️ Cloudinary configured: ${process.env.CLOUDINARY_CLOUD_NAME}`);
 
-// ─── ENSURE AUTH DIRECTORY EXISTS (Local/Termux only) ───────────────
-if (!IS_RENDER) {
-  const authDir = `${BASE_DIR}/auth_info`;
-  if (!fs.existsSync(authDir)) {
-    fs.mkdirSync(authDir, { recursive: true });
-  }
+// ─── ENSURE AUTH DIRECTORY EXISTS ───────────────────────────────────
+const authDir = path.resolve(BASE_DIR, 'auth_info');
+if (!fs.existsSync(authDir)) {
+  fs.mkdirSync(authDir, { recursive: true });
 }
 
 // ─── MONGODB ────────────────────────────────────────────────────────
@@ -127,6 +126,7 @@ const Order = mongoose.model('Order', OrderSchema);
 // ─── SESSIONS MAP ───────────────────────────────────────────────────
 const sessions = new Map();
 const activeCarts = new Map();
+const qrCodeCache = new Map(); // In-memory QR cache for base64 fallback
 
 // ─── HELPERS ────────────────────────────────────────────────────────
 function getMessageText(msg) {
@@ -365,7 +365,7 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
         saveCreds = mongoAuth.saveCreds;
       } catch (mongoErr) {
         console.log(`⚠️ MongoDB auth failed, falling back to file auth: ${mongoErr.message}`);
-        const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
+        const sessionDir = path.resolve(BASE_DIR, 'auth_info', clean);
         if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
         const fileAuth = await useMultiFileAuthState(sessionDir);
         state = fileAuth.state;
@@ -373,7 +373,7 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
       }
     } else {
       console.log(`💾 Using file auth state for ${clean}`);
-      const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
+      const sessionDir = path.resolve(BASE_DIR, 'auth_info', clean);
       if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
       const fileAuth = await useMultiFileAuthState(sessionDir);
       state = fileAuth.state;
@@ -433,43 +433,50 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
               type: 'png'
             });
             
-            // ── FIX: Always save QR code file for web access ──
-            const qrPath = `${BASE_DIR}/auth_info/${clean}/qr-code.png`;
+            // ── FIX: Save QR with absolute path ──
+            const sessionDir = path.resolve(BASE_DIR, 'auth_info', clean);
+            if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+            const qrPath = path.join(sessionDir, 'qr-code.png');
             fs.writeFileSync(qrPath, qrBuffer);
             console.log(`   Saved to: ${qrPath}`);
             
+            // ── FIX: Cache base64 for fallback ──
+            const qrBase64 = qrBuffer.toString('base64');
+            qrCodeCache.set(clean, {
+              base64: qrBase64,
+              createdAt: Date.now()
+            });
+            
             console.log(`\n📱 [${clean}] QR Code generated!`);
             
-            // ── FIX: On Render, serve QR via web URL instead of terminal ──
+            // ── FIX: Better QR delivery on Render ──
             if (IS_RENDER && !isAdmin) {
-              // For vendor QR on Render: send to admin via WhatsApp if admin session exists
               const adminSession = sessions.get(cleanPhone(ADMIN_PHONE));
+              const qrCaption = `🔑 *QR Code for ${clean}*\n\n` +
+                `Scan this with your WhatsApp:\n` +
+                `1. Open WhatsApp on your phone\n` +
+                `2. Tap ⋮ → Linked Devices → Link a Device\n` +
+                `3. Point camera at this QR code\n\n` +
+                `⏰ Expires in 3 minutes!\n\n` +
+                `If image doesn't load, visit:\n${WEBHOOK_BASE}/qr/${clean}\n\n` +
+                `Or view base64: ${WEBHOOK_BASE}/qr-base64/${clean}`;
+              
               if (adminSession?.socket && requesterJid) {
                 await adminSession.socket.sendMessage(requesterJid, {
                   image: qrBuffer,
-                  caption: `🔑 *QR Code for ${clean}*\n\n` +
-                    `Scan this with your WhatsApp:\n` +
-                    `1. Open WhatsApp on your phone\n` +
-                    `2. Tap ⋮ → Linked Devices → Link a Device\n` +
-                    `3. Point camera at this QR code\n\n` +
-                    `⏰ Expires in 3 minutes!\n\n` +
-                    `Or visit: ${WEBHOOK_BASE}/qr/${clean}`
+                  caption: qrCaption
                 });
                 console.log(`   📤 QR code sent to ${requesterJid} via admin session`);
               } else if (adminSession?.socket) {
-                // Fallback: send to admin phone if no requesterJid
                 await adminSession.socket.sendMessage(formatJid(ADMIN_PHONE), {
                   image: qrBuffer,
-                  caption: `🔑 *QR Code for ${clean}*\n\n` +
-                    `Scan this with your WhatsApp to link.\n\n` +
-                    `Or visit: ${WEBHOOK_BASE}/qr/${clean}`
+                  caption: qrCaption
                 });
                 console.log(`   📤 QR code sent to admin phone`);
               } else {
                 console.log(`   ⚠️ Admin session not available`);
               }
             } else if (requesterJid) {
-              // Local/Termux with requester
               const adminSession = sessions.get(cleanPhone(ADMIN_PHONE));
               if (adminSession?.socket) {
                 await adminSession.socket.sendMessage(requesterJid, {
@@ -487,7 +494,6 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
                 console.log(terminalQR);
               }
             } else {
-              // Local/Termux without requester - show in terminal
               const terminalQR = await QRCode.toString(qr, { type: 'terminal', small: true });
               console.log(terminalQR);
             }
@@ -506,6 +512,9 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
           sessionData.connected = true;
           sessionData.reconnectAttempts = 0;
           console.log(`✅ [${clean}] CONNECTED`);
+          
+          // Clear QR cache on successful connection
+          qrCodeCache.delete(clean);
           
           if (!isAdmin) {
             await Vendor.updateOne({ phone: clean }, { $set: { auth_connected: true } });
@@ -607,11 +616,12 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
             console.log(`🚫 [${clean}] Session unauthorized. Clearing auth...`);
             sessionData.resolved = true;
             sessions.delete(clean);
+            qrCodeCache.delete(clean);
             
             if (IS_RENDER && dbReady) {
               await mongoose.model('AuthState').deleteOne({ phone: clean });
             } else {
-              const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
+              const sessionDir = path.resolve(BASE_DIR, 'auth_info', clean);
               if (fs.existsSync(sessionDir)) {
                 fs.rmSync(sessionDir, { recursive: true, force: true });
               }
@@ -663,11 +673,12 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
           } else {
             sessionData.resolved = true;
             sessions.delete(clean);
+            qrCodeCache.delete(clean);
             
             if (IS_RENDER && dbReady) {
               await mongoose.model('AuthState').deleteOne({ phone: clean });
             } else {
-              const sessionDir = `${BASE_DIR}/auth_info/${clean}`;
+              const sessionDir = path.resolve(BASE_DIR, 'auth_info', clean);
               if (fs.existsSync(sessionDir)) {
                 fs.rmSync(sessionDir, { recursive: true, force: true });
               }
@@ -687,6 +698,7 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
         if (!sessionData.resolved && !sessionData.connected) {
           console.log(`⏰ [${clean}] QR timeout reached`);
           sessionData.resolved = true;
+          qrCodeCache.delete(clean);
           resolve({ success: false, error: 'Timeout - QR code expired. Please try again.' });
         }
       }, 180000);
@@ -733,6 +745,7 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
   } catch (err) {
     console.error(`❌ [${clean}] Session creation failed:`, err.message);
     sessions.delete(clean);
+    qrCodeCache.delete(clean);
     return { success: false, error: err.message };
   }
 }
@@ -888,8 +901,8 @@ async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPho
       `• *resume* - Resume your store\n` +
       `• *stats* - View sales stats\n` +
       `• *sales today* - Today's sales\n` +
-      `• *sales week* - This week's sales\n` +
-      `• *sales month* - This month's sales\n` +
+      `• *sales week* - This week\n` +
+      `• *sales month* - This month\n` +
       `• *balance* - Check payouts\n` +
       `• *payout* - Withdraw balance\n` +
       `• *disconnect* - Disconnect WhatsApp\n\n` +
@@ -925,7 +938,6 @@ async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPho
     const productName = text.substring(7).trim();
     const idx = vendor.products.findIndex(p => p.name.toLowerCase() === productName.toLowerCase());
     if (idx >= 0) {
-      // Delete image from Cloudinary if exists
       const product = vendor.products[idx];
       if (product.image_url && product.image_url.includes('cloudinary')) {
         try {
@@ -1053,6 +1065,7 @@ async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPho
       try { session.socket.end(); } catch(e) {}
     }
     sessions.delete(sessionPhone);
+    qrCodeCache.delete(sessionPhone);
     vendor.auth_connected = false;
     vendor.status = 'onboarding';
     vendor.onboarding_step = 9;
@@ -1070,7 +1083,6 @@ async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPho
     if (priceMatch && nameMatch) {
       const price = parseInt(priceMatch[1].replace(/,/g, ''));
       
-      // Download image from WhatsApp
       let imageBuffer = null;
       try {
         const session = sessions.get(sessionPhone);
@@ -1090,7 +1102,6 @@ async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPho
 
       let imageUrl = '';
       
-      // Upload to Cloudinary if image downloaded
       if (imageBuffer) {
         const uploadResult = await uploadImageToCloudinary(imageBuffer, vendor.phone, nameMatch);
         if (uploadResult.success) {
@@ -1243,7 +1254,6 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
         if (priceMatch && nameMatch) {
           const price = parseInt(priceMatch[1].replace(/,/g, ''));
           
-          // Download and upload image to Cloudinary during onboarding
           let imageBuffer = null;
           let imageUrl = '';
           
@@ -1313,13 +1323,14 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
         if (IS_RENDER && dbReady) {
           await mongoose.model('AuthState').deleteOne({ phone: cleanPhone(vendor.phone) });
         } else {
-          const sessionDir = `${BASE_DIR}/auth_info/${cleanPhone(vendor.phone)}`;
+          const sessionDir = path.resolve(BASE_DIR, 'auth_info', cleanPhone(vendor.phone));
           if (fs.existsSync(sessionDir)) {
             fs.rmSync(sessionDir, { recursive: true, force: true });
           }
         }
         
         sessions.delete(cleanPhone(vendor.phone));
+        qrCodeCache.delete(cleanPhone(vendor.phone));
         
         await sendMessage(adminPhone, fromJid, `🔑 Generating fresh QR code... Please wait.`);
         
@@ -1362,13 +1373,11 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
   }
   
   if (lowerText === 'menu' || lowerText === 'start' || hasBuyingIntent) {
-    // Send product catalog with images
     if (vendor.products.length === 0) {
       await sendMessage(sessionPhone, fromJid, `👋 *Welcome to ${vendor.business_name}!*\n\n${vendor.description}\n\n📝 No products available yet. Please check back later!`);
       return;
     }
 
-    // Send welcome text first
     let menuText = `👋 *Welcome to ${vendor.business_name}!*\n\n`;
     menuText += `${vendor.description}\n\n`;
     menuText += `*Our Products:*\n`;
@@ -1380,14 +1389,12 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
     
     await sendMessage(sessionPhone, fromJid, menuText);
 
-    // Send product images as album/carousel
     const session = sessions.get(sessionPhone);
     if (session?.socket) {
       for (let i = 0; i < vendor.products.length; i++) {
         const product = vendor.products[i];
         if (product.image_url) {
           try {
-            // Download image from Cloudinary URL
             const imageResponse = await axios.get(product.image_url, { responseType: 'arraybuffer' });
             const imageBuffer = Buffer.from(imageResponse.data);
             
@@ -1426,7 +1433,6 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
     const product = vendor.products[productNum - 1];
     activeCarts.set(cartKey, { product, qty: 1 });
     
-    // Send product image with details if available
     const session = sessions.get(sessionPhone);
     if (session?.socket && product.image_url) {
       try {
@@ -1572,16 +1578,94 @@ app.get('/', (req, res) => {
   res.json({ status: 'NaijaSales AI is running', connectedSessions: sessions.size });
 });
 
-// ── FIX: Add QR code viewing endpoint ──
+// ── FIX: QR code viewing endpoint with proper absolute path ──
 app.get('/qr/:phone', (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
-  const qrPath = `${BASE_DIR}/auth_info/${phone}/qr-code.png`;
+  const qrPath = path.resolve(BASE_DIR, 'auth_info', phone, 'qr-code.png');
+  
+  console.log(`📱 QR request for ${phone}, looking at: ${qrPath}`);
   
   if (fs.existsSync(qrPath)) {
-    res.sendFile(qrPath, { root: '/' });
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(qrPath);
   } else {
-    res.status(404).json({ error: 'QR code not found. It may have expired.' });
+    // Fallback: check in-memory cache
+    const cached = qrCodeCache.get(phone);
+    if (cached && cached.base64) {
+      const imgBuffer = Buffer.from(cached.base64, 'base64');
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.send(imgBuffer);
+    } else {
+      res.status(404).json({ 
+        error: 'QR code not found. It may have expired or the server filesystem was reset.',
+        hint: 'On Render free tier, files are lost when the service spins down. The QR should have been sent to your WhatsApp directly.'
+      });
+    }
   }
+});
+
+// ── NEW: Base64 QR endpoint (works even if filesystem is ephemeral) ──
+app.get('/qr-base64/:phone', (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  const cached = qrCodeCache.get(phone);
+  
+  if (cached && cached.base64) {
+    res.json({
+      phone: phone,
+      base64: `data:image/png;base64,${cached.base64}`,
+      createdAt: new Date(cached.createdAt).toISOString(),
+      expiresIn: '3 minutes from creation'
+    });
+  } else {
+    res.status(404).json({ error: 'QR code not in memory. It may have expired.' });
+  }
+});
+
+// ── NEW: HTML page that displays QR with auto-refresh ──
+app.get('/qr-view/:phone', (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WhatsApp QR - ${phone}</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; display: flex; flex-direction: column; align-items: center; padding: 20px; background: #111; color: #fff; }
+    h1 { font-size: 18px; margin-bottom: 10px; }
+    .qr-box { background: #fff; padding: 15px; border-radius: 12px; margin: 15px 0; }
+    img { max-width: 300px; width: 100%; height: auto; }
+    .instructions { max-width: 300px; text-align: left; font-size: 14px; line-height: 1.6; color: #ccc; }
+    .instructions ol { padding-left: 20px; }
+    .timer { color: #ff6b6b; font-weight: bold; margin-top: 10px; }
+    .fallback { margin-top: 15px; font-size: 12px; color: #888; }
+  </style>
+</head>
+<body>
+  <h1>🔗 Link WhatsApp for ${phone}</h1>
+  <div class="qr-box">
+    <img src="/qr/${phone}" alt="QR Code" onerror="this.style.display='none'; document.getElementById('error').style.display='block';">
+  </div>
+  <div id="error" style="display:none; color: #ff6b6b; text-align: center;">
+    <p>⚠️ QR image failed to load.</p>
+    <p>It may have expired or the server restarted.</p>
+    <p>Please request a new QR code from WhatsApp.</p>
+  </div>
+  <div class="instructions">
+    <ol>
+      <li>Open WhatsApp on your phone</li>
+      <li>Tap <b>⋮</b> → <b>Linked Devices</b> → <b>Link a Device</b></li>
+      <li>Point your camera at the QR code above</li>
+    </ol>
+  </div>
+  <p class="timer">⏰ Expires in 3 minutes!</p>
+  <p class="fallback">If this doesn't work, check your WhatsApp messages — the QR was also sent there.</p>
+</body>
+</html>
+  `);
 });
 
 app.get('/health', (req, res) => {
