@@ -12,8 +12,17 @@ const fs = require('fs');
 const crypto = require('crypto');
 const axios = require('axios');
 const { useMongoDBAuthState } = require('./authStore');
+const cloudinary = require('cloudinary').v2;
 
 const app = express();
+
+// ─── CLOUDINARY CONFIG ──────────────────────────────────────────────
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true
+});
 
 // Raw body parser for Paystack webhook (must be before express.json)
 app.use('/webhook/paystack', express.raw({ type: 'application/json' }));
@@ -39,7 +48,13 @@ if (!PAYSTACK_SECRET) {
   process.exit(1);
 }
 
+if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+  console.error('❌ Cloudinary credentials not set in .env');
+  process.exit(1);
+}
+
 console.log(`🔑 Paystack mode: ${IS_TEST_MODE ? 'TEST (subaccounts disabled)' : 'LIVE (subaccounts enabled)'}`);
+console.log(`☁️ Cloudinary configured: ${process.env.CLOUDINARY_CLOUD_NAME}`);
 
 // ─── ENSURE AUTH DIRECTORY EXISTS (Local/Termux only) ───────────────
 if (!IS_RENDER) {
@@ -152,6 +167,43 @@ async function sendMessage(fromPhone, toJid, text) {
   } catch (err) {
     console.error(`❌ [${fromPhone}] Send error:`, err.message);
     return false;
+  }
+}
+
+// ─── CLOUDINARY UPLOAD HELPER ───────────────────────────────────────
+async function uploadImageToCloudinary(imageBuffer, vendorPhone, productName) {
+  try {
+    const publicId = `naijasales/${vendorPhone}/${Date.now()}_${productName.replace(/\s+/g, '_').toLowerCase()}`;
+    
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        {
+          public_id: publicId,
+          folder: `naijasales/vendors/${vendorPhone}`,
+          resource_type: 'image',
+          overwrite: true,
+          transformation: [
+            { width: 800, height: 800, crop: 'limit' },
+            { quality: 'auto', fetch_format: 'auto' }
+          ]
+        },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      uploadStream.end(imageBuffer);
+    });
+
+    console.log(`☁️ Cloudinary upload success: ${result.secure_url}`);
+    return {
+      success: true,
+      url: result.secure_url,
+      public_id: result.public_id
+    };
+  } catch (err) {
+    console.error(`❌ Cloudinary upload failed:`, err.message);
+    return { success: false, error: err.message };
   }
 }
 
@@ -381,16 +433,44 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
               type: 'png'
             });
             
-            if (!IS_RENDER) {
-              const qrPath = `${BASE_DIR}/auth_info/${clean}/qr-code.png`;
-              fs.writeFileSync(qrPath, qrBuffer);
-              console.log(`   Saved to: ${qrPath}`);
-            }
+            // ── FIX: Always save QR code file for web access ──
+            const qrPath = `${BASE_DIR}/auth_info/${clean}/qr-code.png`;
+            fs.writeFileSync(qrPath, qrBuffer);
+            console.log(`   Saved to: ${qrPath}`);
+            
             console.log(`\n📱 [${clean}] QR Code generated!`);
             
-            if (requesterJid) {
+            // ── FIX: On Render, serve QR via web URL instead of terminal ──
+            if (IS_RENDER && !isAdmin) {
+              // For vendor QR on Render: send to admin via WhatsApp if admin session exists
               const adminSession = sessions.get(cleanPhone(ADMIN_PHONE));
-              
+              if (adminSession?.socket && requesterJid) {
+                await adminSession.socket.sendMessage(requesterJid, {
+                  image: qrBuffer,
+                  caption: `🔑 *QR Code for ${clean}*\n\n` +
+                    `Scan this with your WhatsApp:\n` +
+                    `1. Open WhatsApp on your phone\n` +
+                    `2. Tap ⋮ → Linked Devices → Link a Device\n` +
+                    `3. Point camera at this QR code\n\n` +
+                    `⏰ Expires in 3 minutes!\n\n` +
+                    `Or visit: ${WEBHOOK_BASE}/qr/${clean}`
+                });
+                console.log(`   📤 QR code sent to ${requesterJid} via admin session`);
+              } else if (adminSession?.socket) {
+                // Fallback: send to admin phone if no requesterJid
+                await adminSession.socket.sendMessage(formatJid(ADMIN_PHONE), {
+                  image: qrBuffer,
+                  caption: `🔑 *QR Code for ${clean}*\n\n` +
+                    `Scan this with your WhatsApp to link.\n\n` +
+                    `Or visit: ${WEBHOOK_BASE}/qr/${clean}`
+                });
+                console.log(`   📤 QR code sent to admin phone`);
+              } else {
+                console.log(`   ⚠️ Admin session not available`);
+              }
+            } else if (requesterJid) {
+              // Local/Termux with requester
+              const adminSession = sessions.get(cleanPhone(ADMIN_PHONE));
               if (adminSession?.socket) {
                 await adminSession.socket.sendMessage(requesterJid, {
                   image: qrBuffer,
@@ -403,11 +483,11 @@ async function createSession(phone, isAdmin = false, requesterJid = null) {
                 });
                 console.log(`   📤 QR code sent to ${requesterJid} via admin session`);
               } else {
-                console.log(`   ⚠️ Admin session not available, showing terminal QR`);
                 const terminalQR = await QRCode.toString(qr, { type: 'terminal', small: true });
                 console.log(terminalQR);
               }
             } else {
+              // Local/Termux without requester - show in terminal
               const terminalQR = await QRCode.toString(qr, { type: 'terminal', small: true });
               console.log(terminalQR);
             }
@@ -678,7 +758,7 @@ async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
     if (!vendor || vendor.status !== 'active') {
       return;
     }
-    await handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPhone, senderClean);
+    await handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPhone, senderClean, msg);
     return;
   }
 
@@ -708,7 +788,7 @@ async function handleIncomingMessage(sessionPhone, msg, isAdminSession) {
   }
 
   if (vendor.status === 'active') {
-    await handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPhone, senderClean);
+    await handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPhone, senderClean, msg);
     return;
   }
 
@@ -836,7 +916,6 @@ async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPho
     return true;
   }
 
-  // ── FIX: Handle "done" after adding products ──
   if (lowerText === 'done') {
     await sendMessage(sessionPhone, fromJid, `✅ Product adding complete. Type *"products"* to view your catalog.`);
     return true;
@@ -846,6 +925,17 @@ async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPho
     const productName = text.substring(7).trim();
     const idx = vendor.products.findIndex(p => p.name.toLowerCase() === productName.toLowerCase());
     if (idx >= 0) {
+      // Delete image from Cloudinary if exists
+      const product = vendor.products[idx];
+      if (product.image_url && product.image_url.includes('cloudinary')) {
+        try {
+          const publicId = product.image_url.split('/').slice(-2).join('/').split('.')[0];
+          await cloudinary.uploader.destroy(publicId);
+          console.log(`☁️ Deleted Cloudinary image: ${publicId}`);
+        } catch (e) {
+          console.log(`⚠️ Failed to delete Cloudinary image: ${e.message}`);
+        }
+      }
       vendor.products.splice(idx, 1);
       await vendor.save();
       await sendMessage(sessionPhone, fromJid, `✅ *${productName}* removed.`);
@@ -971,23 +1061,54 @@ async function handleVendorCommands(vendor, fromJid, text, lowerText, sessionPho
     return true;
   }
 
-  // ── FIX: Support # and $ in price matching ──
+  // ─── HANDLE IMAGE MESSAGE (Product with Cloudinary Upload) ──────
   if (msg.message?.imageMessage) {
     const caption = msg.message.imageMessage.caption || '';
-    // ── FIX: Regex now matches ₦, N, #, and $ symbols ──
     const priceMatch = caption.match(/[₦N#$]\s*(\d+(?:,\d{3})*)/);
-    // ── FIX: Remove all price symbols from caption to get name ──
     const nameMatch = caption.replace(/[₦N#$]\s*\d+(?:,\d{3})*/, '').trim();
     
     if (priceMatch && nameMatch) {
       const price = parseInt(priceMatch[1].replace(/,/g, ''));
+      
+      // Download image from WhatsApp
+      let imageBuffer = null;
+      try {
+        const session = sessions.get(sessionPhone);
+        if (session?.socket) {
+          const stream = await session.socket.downloadMediaMessage(msg);
+          if (stream) {
+            const chunks = [];
+            for await (const chunk of stream) {
+              chunks.push(chunk);
+            }
+            imageBuffer = Buffer.concat(chunks);
+          }
+        }
+      } catch (err) {
+        console.error(`❌ Failed to download image:`, err.message);
+      }
+
+      let imageUrl = '';
+      
+      // Upload to Cloudinary if image downloaded
+      if (imageBuffer) {
+        const uploadResult = await uploadImageToCloudinary(imageBuffer, vendor.phone, nameMatch);
+        if (uploadResult.success) {
+          imageUrl = uploadResult.url;
+        } else {
+          console.log(`⚠️ Cloudinary upload failed, storing without image`);
+        }
+      }
+
       vendor.products.push({
         name: nameMatch,
         price: price,
-        image_url: msg.message.imageMessage.url || ''
+        image_url: imageUrl
       });
       await vendor.save();
-      await sendMessage(sessionPhone, fromJid, `✅ *${nameMatch}* added at ₦${price.toLocaleString()}. Send another or type *"done"*.`);
+      
+      const imageNote = imageUrl ? 'with image ☁️' : '(image upload failed)';
+      await sendMessage(sessionPhone, fromJid, `✅ *${nameMatch}* added at ₦${price.toLocaleString()} ${imageNote}. Send another or type *"done"*.`);
     } else {
       await sendMessage(sessionPhone, fromJid, `❌ Please include price in caption.\nExample: "Red Ankara ₦5500" or "Red Ankara #5500"`);
     }
@@ -1116,19 +1237,48 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
         );
       } else if (msg.message?.imageMessage) {
         const caption = msg.message.imageMessage.caption || '';
-        // ── FIX: Same regex fix for onboarding product photos ──
         const priceMatch = caption.match(/[₦N#$]\s*(\d+(?:,\d{3})*)/);
         const nameMatch = caption.replace(/[₦N#$]\s*\d+(?:,\d{3})*/, '').trim();
         
         if (priceMatch && nameMatch) {
           const price = parseInt(priceMatch[1].replace(/,/g, ''));
+          
+          // Download and upload image to Cloudinary during onboarding
+          let imageBuffer = null;
+          let imageUrl = '';
+          
+          try {
+            const session = sessions.get(adminPhone);
+            if (session?.socket) {
+              const stream = await session.socket.downloadMediaMessage(msg);
+              if (stream) {
+                const chunks = [];
+                for await (const chunk of stream) {
+                  chunks.push(chunk);
+                }
+                imageBuffer = Buffer.concat(chunks);
+              }
+            }
+          } catch (err) {
+            console.error(`❌ Failed to download onboarding image:`, err.message);
+          }
+
+          if (imageBuffer) {
+            const uploadResult = await uploadImageToCloudinary(imageBuffer, vendor.phone, nameMatch);
+            if (uploadResult.success) {
+              imageUrl = uploadResult.url;
+            }
+          }
+
           vendor.products.push({
             name: nameMatch,
             price: price,
-            image_url: msg.message.imageMessage.url || ''
+            image_url: imageUrl
           });
           await vendor.save();
-          await sendMessage(adminPhone, fromJid, `✅ *${nameMatch}* added at ₦${price.toLocaleString()}. Send another or type *"done"*.`);
+          
+          const imageNote = imageUrl ? 'with image ☁️' : '(image upload failed)';
+          await sendMessage(adminPhone, fromJid, `✅ *${nameMatch}* added at ₦${price.toLocaleString()} ${imageNote}. Send another or type *"done"*.`);
         } else {
           await sendMessage(adminPhone, fromJid, `❌ Please include price in caption.\nExample: "Red Ankara ₦5500" or "Red Ankara #5500"`);
         }
@@ -1194,7 +1344,7 @@ async function handleOnboarding(vendor, fromJid, text, lowerText, adminPhone, ms
 }
 
 // ─── CUSTOMER MESSAGE HANDLER ───────────────────────────────────────
-async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPhone, customerPhone) {
+async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPhone, customerPhone, msg) {
   if (fromJid.includes('status@broadcast')) {
     return;
   }
@@ -1212,15 +1362,45 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
   }
   
   if (lowerText === 'menu' || lowerText === 'start' || hasBuyingIntent) {
-    let menu = `👋 *Welcome to ${vendor.business_name}!*\n\n`;
-    menu += `${vendor.description}\n\n`;
-    menu += `*Our Products:*\n`;
+    // Send product catalog with images
+    if (vendor.products.length === 0) {
+      await sendMessage(sessionPhone, fromJid, `👋 *Welcome to ${vendor.business_name}!*\n\n${vendor.description}\n\n📝 No products available yet. Please check back later!`);
+      return;
+    }
+
+    // Send welcome text first
+    let menuText = `👋 *Welcome to ${vendor.business_name}!*\n\n`;
+    menuText += `${vendor.description}\n\n`;
+    menuText += `*Our Products:*\n`;
     vendor.products.forEach((p, i) => {
-      menu += `${i+1}. ${p.name} - ₦${p.price.toLocaleString()}\n`;
+      menuText += `${i+1}. ${p.name} - ₦${p.price.toLocaleString()}\n`;
     });
-    menu += `\nReply with a product *number* to order.\n`;
-    menu += `Or type *"help"* for assistance.`;
-    await sendMessage(sessionPhone, fromJid, menu);
+    menuText += `\nReply with a product *number* to order.\n`;
+    menuText += `Or type *"help"* for assistance.`;
+    
+    await sendMessage(sessionPhone, fromJid, menuText);
+
+    // Send product images as album/carousel
+    const session = sessions.get(sessionPhone);
+    if (session?.socket) {
+      for (let i = 0; i < vendor.products.length; i++) {
+        const product = vendor.products[i];
+        if (product.image_url) {
+          try {
+            // Download image from Cloudinary URL
+            const imageResponse = await axios.get(product.image_url, { responseType: 'arraybuffer' });
+            const imageBuffer = Buffer.from(imageResponse.data);
+            
+            await session.socket.sendMessage(fromJid, {
+              image: imageBuffer,
+              caption: `${i+1}. *${product.name}*\n₦${product.price.toLocaleString()}`
+            });
+          } catch (err) {
+            console.log(`⚠️ Failed to send product image ${product.name}: ${err.message}`);
+          }
+        }
+      }
+    }
     return;
   }
 
@@ -1246,11 +1426,31 @@ async function handleCustomerMessage(vendor, fromJid, text, lowerText, sessionPh
     const product = vendor.products[productNum - 1];
     activeCarts.set(cartKey, { product, qty: 1 });
     
-    await sendMessage(sessionPhone, fromJid, 
-      `*${product.name}*\n` +
-      `Price: ₦${product.price.toLocaleString()}\n\n` +
-      `Reply *"buy"* to purchase, or *"cancel"* to go back.`
-    );
+    // Send product image with details if available
+    const session = sessions.get(sessionPhone);
+    if (session?.socket && product.image_url) {
+      try {
+        const imageResponse = await axios.get(product.image_url, { responseType: 'arraybuffer' });
+        const imageBuffer = Buffer.from(imageResponse.data);
+        
+        await session.socket.sendMessage(fromJid, {
+          image: imageBuffer,
+          caption: `*${product.name}*\nPrice: ₦${product.price.toLocaleString()}\n\nReply *"buy"* to purchase, or *"cancel"* to go back.`
+        });
+      } catch (err) {
+        await sendMessage(sessionPhone, fromJid, 
+          `*${product.name}*\n` +
+          `Price: ₦${product.price.toLocaleString()}\n\n` +
+          `Reply *"buy"* to purchase, or *"cancel"* to go back.`
+        );
+      }
+    } else {
+      await sendMessage(sessionPhone, fromJid, 
+        `*${product.name}*\n` +
+        `Price: ₦${product.price.toLocaleString()}\n\n` +
+        `Reply *"buy"* to purchase, or *"cancel"* to go back.`
+      );
+    }
     return;
   }
 
@@ -1372,6 +1572,18 @@ app.get('/', (req, res) => {
   res.json({ status: 'NaijaSales AI is running', connectedSessions: sessions.size });
 });
 
+// ── FIX: Add QR code viewing endpoint ──
+app.get('/qr/:phone', (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  const qrPath = `${BASE_DIR}/auth_info/${phone}/qr-code.png`;
+  
+  if (fs.existsSync(qrPath)) {
+    res.sendFile(qrPath, { root: '/' });
+  } else {
+    res.status(404).json({ error: 'QR code not found. It may have expired.' });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -1381,7 +1593,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ─── KEEP-ALIVE PING ────────────────────────────────────────────────
+// ─── KEEP-ALIVE PING ────────────────────────────────
 setInterval(() => {
   if (WEBHOOK_BASE && WEBHOOK_BASE !== `http://localhost:${process.env.PORT || 3000}`) {
     axios.get(`${WEBHOOK_BASE}/health`)
@@ -1390,7 +1602,7 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// ─── CONNECTION MONITOR ─────────────────────────────────────────────
+// ─── CONNECTION MONITOR ─────────────────────────────
 setInterval(async () => {
   for (const [phone, session] of sessions.entries()) {
     if (!session.connected || !session.socket?.ws) {
@@ -1413,7 +1625,7 @@ setInterval(async () => {
   }
 }, 60000);
 
-// ─── ADMIN SESSION WATCHDOG ─────────────────────────────────────────
+// ─── ADMIN SESSION WATCHDOG ─────────────────────────
 setInterval(async () => {
   if (!dbReady) {
     console.log('⏸️ Watchdog skipped: DB not ready');
@@ -1433,7 +1645,7 @@ setInterval(async () => {
   }
 }, 30000);
 
-// ─── AUTO-RECONNECT ALL SESSIONS ON STARTUP ─────────────────────────
+// ─── AUTO-RECONNECT ALL SESSIONS ON STARTUP ─────────
 async function reconnectAllSessions() {
   if (!dbReady) {
     console.log('⏸️ Reconnect skipped: DB not ready');
@@ -1457,7 +1669,7 @@ async function reconnectAllSessions() {
   }
 }
 
-// ─── START SERVER ─────────────────────────────────────────────────────
+// ─── START SERVER ─────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
